@@ -1,8 +1,10 @@
 {
   "name": "bun-warmer",
   "version": "0.1.0",
-  "author": { "name": "Eugenia Wang" },
-  "description": "Keeps the prompt cache warm with a periodic ping, counts subagent work as activity, never blocks a prompt a human did not type, and writes a state file for a close hook. Inspired by cache-tax by Karan Bansal (MIT).",
+  "author": {
+    "name": "Eugenia Wang"
+  },
+  "description": "Keeps the prompt cache warm with a periodic ping for sessions with a large context, counts subagent work as activity, never blocks a prompt a human did not type, flags silent subagents, and writes an informational state file. Inspired by cache-tax by Karan Bansal (MIT).",
   "userConfig": {
     "intervalMin": {
       "type": "number",
@@ -10,18 +12,27 @@
       "description": "Minutes of quiet before a ping. Default 50; the cache goes cold after 60, so values above 55 are capped. Env BUN_WARMER_INTERVAL_MIN overrides.",
       "default": 50
     },
-    "windowHours": {
+    "windowMin": {
       "type": "number",
-      "title": "Window (hours)",
-      "description": "How long pings continue after the last human prompt. Default 3. Env BUN_WARMER_WINDOW_HOURS overrides.",
-      "default": 3
+      "title": "Window (minutes)",
+      "description": "How long pings continue after the last human prompt. Default 90. Env BUN_WARMER_WINDOW_MIN overrides; env BUN_WARMER_WINDOW_HOURS (if set) overrides both.",
+      "default": 90
+    },
+    "minTokens": {
+      "type": "number",
+      "title": "Minimum context (tokens)",
+      "description": "Ping and show the cold-cache warning only for sessions whose context is at least this many tokens. Default 50000. A session whose size is not yet known is not pinged. Env BUN_WARMER_MIN_TOKENS overrides.",
+      "default": 50000
     },
     "guard": {
       "type": "string",
       "title": "Cold-send guard",
       "description": "warn only shows a note when you type a prompt into a cold session. refuse drops your own first send once. Never applies to subagent or other non-human prompts.",
       "default": "warn",
-      "options": ["warn", "refuse"]
+      "options": [
+        "warn",
+        "refuse"
+      ]
     }
   }
 }

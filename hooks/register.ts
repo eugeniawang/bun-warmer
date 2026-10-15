@@ -5,7 +5,10 @@ const HOUR = 60 * MIN
 const DEFAULT_MAX_HOURS = 12
 const COLD_AFTER_MS = 60 * MIN
 const MAX_INTERVAL_MIN = 55
-const BIG_TOKENS = 50000
+const DEFAULT_MIN_TOKENS = 50000
+const DEFAULT_WINDOW_MIN = 90
+const PULSE_TIMEOUT_MS = 10000
+const PULSE_FALLBACK_PATH = '/Users/Eugenia/Developer/bun-warmer/bin/session-pulse.py'
 const PING_PROMPT = 'Reply with the single word: warm'
 const DEFAULT_ACTIVE_START = 6
 const DEFAULT_ACTIVE_END = 23
@@ -14,6 +17,9 @@ const DEFAULT_ACTIVE_END = 23
 const HUMAN_ORIGINS = ['composer', 'bridge']
 
 type StalledAgent = { id: string; description: string; type: string; minutesSilent: number; firstFlaggedAt: number; messageSent: boolean | null }
+
+/** What the last stall check learned from the transcript pulse. Only our own fixed reason words, never text taken from the pulse. */
+type PulseRecord = { available: boolean; reason: string | null; checkedAt: number; agentsSeen: number }
 
 type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null }
 
@@ -31,6 +37,8 @@ type State = {
   ctx: number
   intervalMs: number
   windowMs: number
+  /** Context size at or above which a ping goes out and the cold-cache warning shows. */
+  minTokens: number
   maxMs: number
   guard: 'warn' | 'refuse'
   ackedAt: number
@@ -46,6 +54,9 @@ type State = {
   lastSkippedAt: number
   /** No ping before this time (the end of the quiet stretch a skip happened in). 0 when none. */
   notBefore: number
+  /** Pings not sent because the context was below minTokens or its size was not yet known. */
+  skippedSmall: number
+  pulse: PulseRecord | null
 }
 
 /** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00; with `withMs`, 2026-10-14T22:39:00.123-07:00. Null for an unset time. */
@@ -80,7 +91,12 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
       cacheReadTokens: s.lastPing.read, cacheWriteTokens: s.lastPing.write,
     },
     intervalMin: s.intervalMs / MIN,
+    windowMin: s.windowMs / MIN,
     windowHours: s.windowMs / HOUR,
+    minTokens: s.minTokens,
+    contextTokens: s.ctx || null,
+    skippedSmall: s.skippedSmall,
+    pulse: s.pulse && { available: s.pulse.available, reason: s.pulse.reason, checkedAt: isoLocal(s.pulse.checkedAt), checkedAtEpoch: epoch(s.pulse.checkedAt), agentsSeen: s.pulse.agentsSeen },
     maxHours: s.maxMs / HOUR,
     note: s.note,
     stallMin: s.stallMs / MIN,
@@ -153,9 +169,9 @@ function positive(text: string | undefined): number | null {
 export function freshState(): State {
   return {
     sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
-    lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: 3 * HOUR, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
+    lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
-    quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0,
+    quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null,
   }
 }
 
@@ -203,7 +219,7 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd })
   lastEventAt.clear()
   errorFileWritten = false
   inFlight.clear()
@@ -293,6 +309,7 @@ function status($: EngineInterface, now: number) {
   const next = !base ? 'waiting for the first turn'
     : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
     : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity'
+    : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
     : `ping in ${fmtDur(Math.max(base + s.intervalMs, s.notBefore) - now)}`
   return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
 }
@@ -392,15 +409,30 @@ export async function stallCheck($: EngineInterface) {
     // An agent never seen producing an event is measured from the first time the watchdog saw it running.
     if (!lastEventAt.has(a.id)) lastEventAt.set(a.id, now)
   }
+  // The transcript pulse is a second signal. Asked once per check, only while some agent is running.
+  const pulse = running.size ? await readPulse($, now) : null
+  if (token !== epoch_) return
   let changed = false
+  if (running.size) {
+    const rec: PulseRecord = { available: pulse?.available === true, reason: pulse?.available === true ? null : (pulse?.reason ?? 'not-run'), checkedAt: now, agentsSeen: pulse?.available === true ? pulse.agents.size : 0 }
+    if (!s.pulse || s.pulse.available !== rec.available || s.pulse.reason !== rec.reason || s.pulse.agentsSeen !== rec.agentsSeen) changed = true
+    s.pulse = rec
+  }
+  /** Silence in ms for an agent: the event-based figure, lowered to the pulse's figure when the pulse knows the agent. Both must exceed the threshold for a flag. */
+  const silenceOf = (id: string): number => {
+    const byEvents = now - (lastEventAt.get(id) ?? now)
+    const p = pulse?.available === true ? pulse.agents.get(normAgentId(id)) : undefined
+    if (!p) return byEvents // pulse unavailable or silent about this agent: the event signal alone
+    return Math.min(byEvents, p.working ? 0 : p.idleMs)
+  }
   s.stalled = s.stalled.filter(f => {
-    const keep = running.has(f.id) && now - (lastEventAt.get(f.id) ?? now) >= s.stallMs
+    const keep = running.has(f.id) && silenceOf(f.id) >= s.stallMs
     if (!keep) changed = true
     return keep
   })
   const fresh: StalledAgent[] = []
   for (const [id, info] of running) {
-    const silent = now - (lastEventAt.get(id) ?? now)
+    const silent = silenceOf(id)
     if (silent < s.stallMs) continue
     const minutes = Math.round(silent / MIN)
     const known = s.stalled.find(f => f.id === id)
@@ -433,6 +465,68 @@ export async function stallCheck($: EngineInterface) {
   if (changed && token === epoch_) {
     status($, now)
     await persist($)
+  }
+}
+
+type PulseAgent = { idleMs: number; working: boolean }
+type PulseReading = { available: true; agents: Map<string, PulseAgent> } | { available: false; reason: string }
+
+/** The pulse names agents `<id>`; the engine may or may not carry an `agent-` prefix. Compare without it. */
+function normAgentId(id: string): string {
+  return id.startsWith('agent-') ? id.slice('agent-'.length) : id
+}
+
+/** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`), the fixed Developer path. `test -f` through argv, no shell. */
+async function pulsePath($: EngineInterface): Promise<string | null> {
+  const candidates: string[] = []
+  try { const env = (await $.env.get('BUN_WARMER_PULSE'))?.trim(); if (env) candidates.push(env) } catch { /* next */ }
+  try { const root = $.plugin.root; if (root) candidates.push(`${root}/bin/session-pulse.py`) } catch { /* next */ }
+  candidates.push(PULSE_FALLBACK_PATH)
+  for (const c of candidates) {
+    try {
+      if ((await $.process.run(['test', '-f', c], { timeoutMs: 2000 })).exitCode === 0) return c
+    } catch { /* try the next */ }
+  }
+  return null
+}
+
+/**
+ * Ask session-pulse.py how long each agent's transcript has been idle. Untrusted output: only finite numbers and booleans are kept,
+ * no string from it is stored, logged or shown. Any failure is `{ available: false, reason }` with a reason word of ours.
+ */
+async function readPulse($: EngineInterface, now: number): Promise<PulseReading> {
+  void now
+  let timer: { cancel: () => void } | null = null
+  try {
+    const script = await pulsePath($)
+    if (!script) return { available: false, reason: 'script-missing' }
+    const sid = s.sid
+    if (!sid) return { available: false, reason: 'no-session-id' }
+    const timeout = new Promise<'timeout'>(res => { timer = $.clock.after(PULSE_TIMEOUT_MS, () => res('timeout')) })
+    const run = $.process.run(['python3', script, sid], { timeoutMs: PULSE_TIMEOUT_MS })
+    run.catch(() => { /* a late rejection after the race is settled */ })
+    const r = await Promise.race([run, timeout])
+    if (r === 'timeout') return { available: false, reason: 'timeout' }
+    if (r.exitCode !== 0) return { available: false, reason: 'nonzero-exit' }
+    let j: unknown
+    try { j = JSON.parse(r.stdout) } catch { return { available: false, reason: 'unparseable' } }
+    if (!j || typeof j !== 'object') return { available: false, reason: 'unparseable' }
+    const o = j as Record<string, unknown>
+    if (o.available !== true) return { available: false, reason: 'pulse-reported-unavailable' }
+    if (!Array.isArray(o.agents)) return { available: false, reason: 'unparseable' }
+    const agents = new Map<string, PulseAgent>()
+    for (const a of o.agents) {
+      if (!a || typeof a !== 'object') continue
+      const x = a as Record<string, unknown>
+      // The id is used only as a lookup key against ids the engine gave us; it is never shown.
+      if (typeof x.id !== 'string' || typeof x.idleSeconds !== 'number' || !Number.isFinite(x.idleSeconds) || x.idleSeconds < 0) continue
+      agents.set(normAgentId(x.id), { idleMs: x.idleSeconds * 1000, working: x.toolInFlight === true })
+    }
+    return { available: true, agents }
+  } catch {
+    return { available: false, reason: 'run-failed' }
+  } finally {
+    if (timer) (timer as { cancel: () => void }).cancel()
   }
 }
 
@@ -481,6 +575,15 @@ async function tick($: EngineInterface) {
   if (!base || now - base >= COLD_AFTER_MS || now - base < s.intervalMs - 1000) {
     schedule($, now)
     return status($, now)
+  }
+  if (s.ctx < s.minTokens) {
+    // A small or not-yet-measured context is not worth keeping warm: no ping, and no retry sooner than one interval.
+    s.skippedSmall++
+    s.notBefore = now + s.intervalMs
+    schedule($, now)
+    status($, now)
+    await persist($)
+    return
   }
   if (isQuiet(now)) {
     // Due during quiet hours: skipped, not failed. Not a refusal, lastPing untouched; the cache may go cold on purpose.
@@ -571,11 +674,16 @@ export const register: Register = (on, options) => {
     resetSession()
     s.sid = await $.session.id()
     const envInterval = positive(await $.env.get('BUN_WARMER_INTERVAL_MIN'))
-    const envWindow = positive(await $.env.get('BUN_WARMER_WINDOW_HOURS'))
+    const envWindowHours = positive(await $.env.get('BUN_WARMER_WINDOW_HOURS'))
+    const envWindowMin = positive(await $.env.get('BUN_WARMER_WINDOW_MIN'))
+    const envMinTokens = positive(await $.env.get('BUN_WARMER_MIN_TOKENS'))
     const optInterval = typeof options.intervalMin === 'number' && options.intervalMin > 0 ? options.intervalMin : 50
-    const optWindow = typeof options.windowHours === 'number' && options.windowHours > 0 ? options.windowHours : 3
+    const optWindowMin = typeof options.windowMin === 'number' && options.windowMin > 0 ? options.windowMin : DEFAULT_WINDOW_MIN
+    const optMinTokens = typeof options.minTokens === 'number' && options.minTokens > 0 ? options.minTokens : DEFAULT_MIN_TOKENS
     s.intervalMs = Math.min(envInterval ?? optInterval, MAX_INTERVAL_MIN) * MIN
-    s.windowMs = (envWindow ?? optWindow) * HOUR
+    // Precedence: env WINDOW_HOURS (the old name, an override when set), then env WINDOW_MIN, then the userConfig windowMin, then 90.
+    s.windowMs = envWindowHours !== null ? envWindowHours * HOUR : (envWindowMin ?? optWindowMin) * MIN
+    s.minTokens = envMinTokens ?? optMinTokens
     s.maxMs = (positive(await $.env.get('BUN_WARMER_MAX_HOURS')) ?? DEFAULT_MAX_HOURS) * HOUR
     s.stallMs = (positive(await $.env.get('BUN_WARMER_STALL_MIN')) ?? 20) * MIN
     s.stallCheckMs = (positive(await $.env.get('BUN_WARMER_STALL_CHECK_MIN')) ?? 5) * MIN
@@ -637,7 +745,7 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const cold = s.lastActivityAt > 0 && now - s.lastActivityAt >= COLD_AFTER_MS
     const typed = typeof e.text === 'string' && !e.text.trimStart().startsWith('/')
-    if (typed && cold && s.ctx >= BIG_TOKENS) {
+    if (typed && cold && s.ctx >= s.minTokens) {
       const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - s.lastActivityAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`
       if (s.guard === 'refuse' && s.ackedAt !== s.lastActivityAt) {
         s.ackedAt = s.lastActivityAt
