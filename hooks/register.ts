@@ -10,6 +10,8 @@ const PING_PROMPT = 'Reply with the single word: warm'
 /** Prompt origins that are a person typing. Everything else (subagent returns, task notifications, peers, schedules, plugins, the SDK) is never blocked. */
 const HUMAN_ORIGINS = ['composer', 'bridge']
 
+type StalledAgent = { id: string; description: string; type: string; minutesSilent: number; firstFlaggedAt: number; messageSent: boolean | null }
+
 type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null }
 
 type State = {
@@ -28,6 +30,9 @@ type State = {
   guard: 'warn' | 'refuse'
   ackedAt: number
   note: string | null
+  stallMs: number
+  stallCheckMs: number
+  stalled: StalledAgent[]
 }
 
 /** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00. Null for an unset time. */
@@ -62,6 +67,12 @@ export function stateFile(s: State): Record<string, unknown> {
     intervalMin: s.intervalMs / MIN,
     windowHours: s.windowMs / HOUR,
     note: s.note,
+    stallMin: s.stallMs / MIN,
+    stallCheckMin: s.stallCheckMs / MIN,
+    stalledAgents: s.stalled.map(a => ({
+      id: a.id, description: a.description, type: a.type, minutesSilent: a.minutesSilent,
+      firstFlaggedAt: isoLocal(a.firstFlaggedAt), firstFlaggedAtEpoch: epoch(a.firstFlaggedAt), messageSent: a.messageSent,
+    })),
   }
 }
 
@@ -82,11 +93,15 @@ export function freshState(): State {
   return {
     sid: '', armed: false, armedAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
     lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: 3 * HOUR, guard: 'warn', ackedAt: 0, note: null,
+    stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
   }
 }
 
 const s = freshState()
 let timer: { cancel: () => void } | null = null
+let stallTimer: { cancel: () => void } | null = null
+/** Last event seen per subagent id (turn.step, turn.complete, tool.call carrying that agentId). Not persisted. */
+const lastEventAt = new Map<string, number>()
 let pinging = false
 let writes: Promise<void> = Promise.resolve()
 
@@ -111,11 +126,17 @@ function persist($: EngineInterface) {
 }
 
 function status($: EngineInterface, now: number) {
-  if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}` : undefined)
+  if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}` : stallText().slice(3) || undefined)
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
+  const stall = stallText()
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
   const next = !base ? 'waiting for the first turn' : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity' : `ping in ${fmtDur(base + s.intervalMs - now)}`
-  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}`)
+  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}`)
+}
+
+function stallText(): string {
+  if (!s.stalled.length) return ''
+  return ` · STALLED: ${s.stalled.map(a => `${a.description} ${a.minutesSilent}m`).join(', ')}`
 }
 
 function cancel() {
@@ -160,6 +181,86 @@ async function hasActiveAgents($: EngineInterface): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+function touchAgent(id: string | undefined, now: number) {
+  if (!id) return
+  lastEventAt.set(id, now)
+}
+
+function stallMessage(a: StalledAgent): string {
+  return `Bun Warmer: subagent ${a.description} (${a.id}) has shown running but silent for ${a.minutesSilent} minutes. Decide: wait, stop it, or respawn it.`
+}
+
+/**
+ * One watchdog pass. Reads $.agent.list (local, no tokens), flags a running agent silent for stallMs once,
+ * clears a flag when the agent is no longer running or has produced an event since. Never stops anything.
+ * The one message to the orchestrator goes through $.prompt.submit (origin kind 'plugin'); the calling plugin's
+ * own prompt.submit hook is skipped by the engine, so the guard cannot drop it.
+ */
+export async function stallCheck($: EngineInterface) {
+  let list
+  try {
+    list = await $.agent.list()
+  } catch {
+    return
+  }
+  const now = await $.clock.now()
+  const running = new Map<string, { description: string; type: string }>()
+  for (const a of list) {
+    if (!a || !a.id || a.status !== 'running') continue
+    running.set(a.id, { description: a.description, type: a.type })
+    // An agent never seen producing an event is measured from the first time the watchdog saw it running.
+    if (!lastEventAt.has(a.id)) lastEventAt.set(a.id, now)
+  }
+  let changed = false
+  s.stalled = s.stalled.filter(f => {
+    const keep = running.has(f.id) && now - (lastEventAt.get(f.id) ?? now) >= s.stallMs
+    if (!keep) changed = true
+    return keep
+  })
+  const fresh: StalledAgent[] = []
+  for (const [id, info] of running) {
+    const silent = now - (lastEventAt.get(id) ?? now)
+    if (silent < s.stallMs) continue
+    const minutes = Math.round(silent / MIN)
+    const known = s.stalled.find(f => f.id === id)
+    if (known) {
+      if (known.minutesSilent !== minutes) { known.minutesSilent = minutes; changed = true }
+      continue
+    }
+    const entry: StalledAgent = { id, description: info.description, type: info.type, minutesSilent: minutes, firstFlaggedAt: now, messageSent: null }
+    s.stalled.push(entry)
+    fresh.push(entry)
+    changed = true
+  }
+  for (const f of fresh) {
+    try {
+      const r = await Promise.race([
+        $.prompt.submit({ text: stallMessage(f) }),
+        // submit resolves when the prompt enters or is queued; do not hold the watchdog on a busy loop forever.
+        new Promise<'pending'>(res => { $.clock.after(15000, () => res('pending')) }),
+      ])
+      f.messageSent = r === 'pending' ? true : !(r && 'drop' in r && r.drop)
+    } catch (err) {
+      f.messageSent = false
+      $.ui.log(`bun-warmer: could not message the orchestrator about a stalled subagent (${err instanceof Error ? err.message : String(err)})`)
+    }
+  }
+  if (changed) {
+    status($, now)
+    await persist($)
+  }
+}
+
+function scheduleStall($: EngineInterface) {
+  if (stallTimer) stallTimer.cancel()
+  stallTimer = $.clock.after(s.stallCheckMs, () => { void stallCheck($).finally(() => { if (stallTimer) scheduleStall($) }) })
+}
+
+function stopStall() {
+  if (stallTimer) stallTimer.cancel()
+  stallTimer = null
 }
 
 async function tick($: EngineInterface) {
@@ -244,14 +345,18 @@ export const register: Register = (on, options) => {
     const optWindow = typeof options.windowHours === 'number' && options.windowHours > 0 ? options.windowHours : 3
     s.intervalMs = Math.min(envInterval ?? optInterval, MAX_INTERVAL_MIN) * MIN
     s.windowMs = (envWindow ?? optWindow) * HOUR
+    s.stallMs = (positive(await $.env.get('BUN_WARMER_STALL_MIN')) ?? 20) * MIN
+    s.stallCheckMs = (positive(await $.env.get('BUN_WARMER_STALL_CHECK_MIN')) ?? 5) * MIN
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
     await arm($, await $.clock.now())
+    scheduleStall($)
     return r
   })
 
   on('session.end', async ($, e, next) => {
+    stopStall()
     await disarm($, e.reason === 'clear' ? 'cleared' : 'session ended')
     return next(e)
   })
@@ -292,14 +397,21 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     // Any loop counts, subagents included: an orchestrator waiting on them is busy, not idle.
+    touchAgent(e.agentId, await $.clock.now())
     await activity($, false)
     yield* next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    touchAgent(e.agentId, await $.clock.now())
     await refreshCtx($)
     await activity($, false)
     return r
+  })
+
+  on('tool.call', async ($, e, next) => {
+    try { touchAgent(e.agentId, await $.clock.now()) } catch { /* a stall clock must never block a tool call */ }
+    return next(e)
   })
 }
