@@ -115,7 +115,7 @@ describe('quiet hours: the pure rules', () => {
 describe('quiet hours: the schedule', () => {
   test('a session started at 07:00 and left idle stops pinging 3 hours after its last activity, not at 23:00', async ($, on) => {
     const clock = mock.clock(on, { now: OCT14_07 })
-    const w = world(on, clock)
+    const w = world(on, clock, { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(17 * HOUR) // on to midnight, well past 23:00
@@ -129,7 +129,7 @@ describe('quiet hours: the schedule', () => {
 
   test('a ping never extends the window: expiresAt stays where the last real activity put it', async ($, on) => {
     const clock = mock.clock(on, { now: OCT14_07 })
-    const w = world(on, clock)
+    const w = world(on, clock, { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(100 * MIN)
@@ -192,7 +192,7 @@ describe('quiet hours: the schedule', () => {
 
   test('subagent activity still extends the window', async ($, on) => {
     const clock = mock.clock(on, { now: OCT14_07 })
-    const w = world(on, clock)
+    const w = world(on, clock, { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(2.5 * HOUR)
@@ -280,7 +280,7 @@ describe('quiet hours: what stays the same', () => {
 
   test('/clear starts a clean session (skips back to 0) and the quiet-hours setting carries over', async ($, on) => {
     const clock = mock.clock(on, { now: at(2026, 10, 14, 22, 30) })
-    const w = world(on, clock)
+    const w = world(on, clock, { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(51 * MIN) // 23:21: the 23:20 ping was skipped
@@ -288,6 +288,7 @@ describe('quiet hours: what stays the same', () => {
     await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } } as never)
     w.setSid('S2')
     await $.prompt.submit(say('fresh start', composer)) // 23:21, quiet
+    await $.turn.complete(answer()) // a response sets the new session's context size, so the size gate is open
     await clock.advance(51 * MIN) // 00:12: ping due 00:11, quiet again
     expect(w.pingTimes.length).toBe(0)
     expect(w.state('S2').skippedQuiet).toBe(1)

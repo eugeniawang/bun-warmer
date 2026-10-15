@@ -87,7 +87,7 @@ const say = (text: string, origin: PromptOrigin) => ({ text, wait: false, origin
 describe('bun-warmer', () => {
   test('pings after the interval of quiet, then again each interval', async ($, on) => {
     const clock = mock.clock(on, { now: START })
-    const w = world(on, [warm, warm])
+    const w = world(on, [warm, warm], { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(49 * MIN)
@@ -134,7 +134,7 @@ describe('bun-warmer', () => {
     expect(st.sessionId).toBe('S1')
     expect(st.armedAtEpoch).toBe(Math.floor(START / 1000))
     expect(st.lastPingAtEpoch).toBe(Math.floor((START + 50 * MIN) / 1000))
-    expect(st.expiresAtEpoch).toBe(Math.floor((START + 3 * HOUR) / 1000))
+    expect(st.expiresAtEpoch).toBe(Math.floor((START + 90 * MIN) / 1000)) // the default window is 90 minutes
     for (const k of ['armedAt', 'lastPingAt', 'lastActivityAt', 'expiresAt']) expect(st[k]).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$/)
     expect(st.refusals).toBe(0)
   })
