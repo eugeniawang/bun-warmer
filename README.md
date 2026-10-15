@@ -147,14 +147,14 @@ Both mods ping, so load only one. How a folder mod is loaded is from reference.m
 Steps:
 
 1. Turn cache-tax off: `claude plugin disable cache-tax@claude-code-mods`
-2. Load Bun Warmer from its folder. To try it for one session first: `claude --plugin-dir /path/to/bun-warmer`. To load it every session, add this to `~/.claude/settings.json` (merge into the existing `env` block if there is one):
+2. Load Bun Warmer from its folder. To try it for one session first: `claude --plugin-dir /path/to/bun-warmer`. To load it every session, add its folder to `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json` (merge into the existing `env` block if there is one). The value is a colon-joined list: setting it to Bun Warmer's folder alone unloads every other folder mod that was in it. First read the current value, then append:
 
 ```json
-{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/bun-warmer" } }
+{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "<existing folders, colon-joined>:/path/to/bun-warmer" } }
 ```
 
 3. Start a new Claude Code session (a running session does not pick up a settings change).
-4. Confirm it is running: type `/bunwarm`. It answers `bun-warmer on, ... left`. Also check that `~/.claude/bun-warmer/<session-id>.json` exists.
+4. Confirm it is running: type `/bunwarm`. It answers `bun-warmer on, ... left`. The status line reads `bun-warmer · warm · 1h25m left · ping in 50m`: the state is `idle` before the first turn, `warm`, or `cold` (60 minutes with no activity or ping). Also check that `~/.claude/bun-warmer/<session-id>.json` exists.
 
 To undo: remove the `CLAUDE_CODE_PLUGIN_DIRS` line from `~/.claude/settings.json` (or stop passing `--plugin-dir`), run `claude plugin enable cache-tax@claude-code-mods`, and start a new session. `/bunwarm off` stops Bun Warmer for the current session only.
 
