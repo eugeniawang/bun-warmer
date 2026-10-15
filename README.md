@@ -97,7 +97,9 @@ A close-the-session trigger shortly before expiry. The `$.session` API in this b
 
 ## Unproven
 
-See the live-test result below once recorded. Not proven by the unit tests: that a real orchestrator reads the message while it is blocked waiting on a subagent. `$.prompt.submit` is documented as a turn of its own "once the session is idle", so while the main loop is mid-turn the message waits until that turn ends. Event coverage for a subagent is turn.step, turn.complete and tool.call; a subagent that streams for a long time inside one model step would look quiet.
+Live test, 2026-10-14 (headless `claude -p --model haiku --plugin-dir`, STALL_MIN=1, STALL_CHECK_MIN=1, one background haiku subagent running a 240-second Python sleep): the state file listed the agent in `stalledAgents` with `messageSent: true` (flagged 23:02:02), and the orchestrator's transcript showed the exact Bun Warmer message and it acted on it. A first attempt failed only because a user hook blocks a bare `sleep` command. The installed cache-tax mod was not excluded from that run (not checked whether it loaded).
+
+Not proven by the unit tests: that a real orchestrator reads the message while it is blocked waiting on a subagent. `$.prompt.submit` is documented as a turn of its own "once the session is idle", so while the main loop is mid-turn the message waits until that turn ends. Event coverage for a subagent is turn.step, turn.complete and tool.call; a subagent that streams for a long time inside one model step would look quiet.
 
 ## Development
 
