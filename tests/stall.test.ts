@@ -72,7 +72,8 @@ describe('stall watchdog', () => {
     expect(st[0].type).toBe('general-purpose')
     expect(st[0].minutesSilent).toBeGreaterThanOrEqual(20)
     expect(st[0].firstFlaggedAt).toMatch(/^\d{4}-\d\d-\d\dT/)
-    expect(w.status.at(-1)).toMatch(/STALLED: build thing/)
+    expect(w.status.at(-1)).toMatch(/STALLED: a1 \d+m/)
+    expect(w.status.at(-1)).not.toContain('build thing')
   })
 
   test('sends one message per stall through $.prompt.submit, as a plugin origin', async ($, on) => {
@@ -82,7 +83,7 @@ describe('stall watchdog', () => {
     w.setAgents([sub()])
     await clock.advance(60 * MIN)
     expect(w.sent.length).toBe(1)
-    expect(w.sent[0].text).toMatch(/^Bun Warmer notice sent at \d\d:\d\d local time, ignore if you have since run \/bunwarm off or the subagent already finished\. Subagent build thing \(a1\) had shown running but silent for \d+ minutes at that time\. Suggested, non-destructive: .*do not stop or respawn it on this notice alone\.$/)
+    expect(w.sent[0].text).toMatch(/^Bun Warmer notice sent at \d\d:\d\d local time, ignore if you have since run \/bunwarm off or the subagent already finished\. A subagent of type general-purpose with id a1 had shown running but silent for \d+ minutes at that time\. Look it up by that id in your own Agent list\. Suggested, non-destructive: .*do not stop or respawn it on this notice alone\.$/)
     expect(w.sent[0].origin.kind).toBe('plugin')
     expect(w.state().stalledAgents[0].messageSent).toBe(true)
   })

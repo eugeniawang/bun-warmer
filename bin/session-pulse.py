@@ -33,10 +33,11 @@ def parse_ts(s):
 
 
 def read_tail(path):
-    """Return (lines, size, mtime, grew). Drops a partial first line (when seeked) and a partial last line.
+    """Return (lines, size, mtime, reason). Drops a partial first line (when seeked) and a partial last line.
 
-    A file being appended to can grow between fstat() and read(). After the read it is stat'ed again; if size or mtime moved,
-    the newer values are returned and grew is True, so a writer in the middle of appending is never reported by its old mtime.
+    reason is None for a clean read. Otherwise the file changed under us and nothing about it can be trusted as quiet:
+    "grew", "shrank", "modified" (same size, new mtime), "replaced" (another inode or device behind the path, e.g. a
+    swapped symlink or a rotated file), or "restat-failed" (the path could not be stat'ed after the read).
     """
     with open(path, "rb") as f:
         st = os.fstat(f.fileno())
@@ -45,16 +46,30 @@ def read_tail(path):
         f.seek(start)
         data = f.read(TAIL_BYTES)
         st2 = os.fstat(f.fileno())
-    grew = (st2.st_size, st2.st_mtime) != (st.st_size, st.st_mtime)
-    if grew:
-        st = st2
+        try:
+            pst = os.stat(path)
+        except OSError:
+            pst = None
+    reason = None
+    if st2.st_size > st.st_size:
+        reason = "grew"
+    elif st2.st_size < st.st_size:
+        reason = "shrank"
+    elif st2.st_mtime != st.st_mtime:
+        reason = "modified"
+    elif pst is None:
+        reason = "restat-failed"
+    elif (pst.st_ino, pst.st_dev) != (st.st_ino, st.st_dev) or pst.st_size != st.st_size or pst.st_mtime != st.st_mtime:
+        reason = "replaced"
+    if reason is not None:
+        st = st2 if reason in ("grew", "shrank", "modified") else st
         size = max(size, st2.st_size)
     lines = data.split(b"\n")
     # The last element is either "" (file ends with newline) or an incomplete line: drop it either way.
     lines = lines[:-1]
     if start > 0 and lines:
         lines = lines[1:]  # first line may have been cut by the seek
-    return lines, size, st.st_mtime, grew
+    return lines, size, st.st_mtime, reason
 
 
 def classify(d):
@@ -124,16 +139,20 @@ def analyze_tail(lines, mtime, loop_n, empty_ok=True):
 
 def file_info(path, now, loop_n, prev_size, have_prev):
     try:
-        lines, size, mtime, grew = read_tail(path)
+        lines, size, mtime, reason = read_tail(path)
     except OSError as e:
         return {"path": path, "error": "unreadable: %s" % type(e).__name__}
+    if reason is not None:
+        mtime = max(mtime, now)  # written just now as far as anyone can tell: never older than the read
     a = analyze_tail(lines, mtime, loop_n, empty_ok=(size == 0))
     info = {
         "path": path,
         "mtime": mtime,
         "size": size,
-        "idleSeconds": max(0.0, round(now - mtime, 3)),
-        "grewDuringRead": grew,
+        "idleSeconds": 0.0 if reason is not None else max(0.0, round(now - mtime, 3)),
+        "grewDuringRead": reason in ("grew", "modified"),
+        "uncertain": reason is not None,
+        "reason": reason,
         "lastLineKind": a["lastLineKind"],
         "lastConversationKind": a["lastConversationKind"],
         "toolInFlight": bool(a["open"]),
