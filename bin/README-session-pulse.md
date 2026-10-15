@@ -18,7 +18,7 @@ Exit 0 always except bad arguments (exit 2, including a session id with path sep
 
 ## Output keys
 
-available, reason, sessionId, now, pulseVersion, main, agents[], newestWriteAt, newestIdleSeconds, anyAgentWriting (an agent file written within 60 s), warnings. Per file: path, mtime, size, idleSeconds, lastLineKind, lastConversationKind, toolInFlight, toolInFlightSeconds, toolInFlightSource, repeatedToolCalls (longest run of identical name+input calls in the tail), loopSuspected (run >= threshold), grewSincePrevious; agents also id, agentType, description.
+available, reason, sessionId, now, pulseVersion, main, agents[], newestWriteAt, newestIdleSeconds, anyAgentWriting (an agent file written within 60 s), warnings. Per file: path, mtime, size, idleSeconds, lastLineKind, lastConversationKind, toolInFlight, toolInFlightSeconds, toolInFlightSource, repeatedToolCalls (longest run of identical name+input calls in the tail), loopSuspected (run >= threshold), grewSincePrevious, grewDuringRead (size or mtime changed between the first stat and the end of the read; the newer values are reported); agents also id, agentType, description.
 
 lastLineKind values: tool_use, tool_result, assistant_text, assistant_thinking, user_text, assistant_other, user_other, other:<type>, unknown (last complete line did not parse, or the tail held no complete line), empty (zero-byte file).
 

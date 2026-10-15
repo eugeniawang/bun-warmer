@@ -263,6 +263,37 @@ class T(unittest.TestCase):
             stop.set()
             th.join()
 
+    def test_file_growing_between_stat_and_read_is_not_reported_idle(self):
+        path = self.e.main([text()], idle=1000)
+        spec = importlib.util.spec_from_file_location("sp_grow", SCRIPT)
+        sp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sp)
+        real_fstat = os.fstat
+        calls = []
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            calls.append(1)
+            if len(calls) == 1:  # a writer appends right after the first stat, before the read finishes
+                with open(path, "ab") as f:
+                    f.write((json.dumps(text()) + "\n").encode())
+                os.utime(path, (NOW - 2, NOW - 2))
+            return st
+
+        sp.os = type("O", (), {})()
+        for k in dir(os):
+            setattr(sp.os, k, getattr(os, k))
+        sp.os.fstat = fstat
+        info = sp.file_info(path, NOW, 5, None, False)
+        self.assertTrue(info["grewDuringRead"])
+        self.assertLessEqual(info["idleSeconds"], 5)  # was 1000 before the second stat
+
+    def test_untouched_file_reports_no_growth(self):
+        self.e.main([text()], idle=1000)
+        o = self.e.pulse()
+        self.assertFalse(o["main"]["grewDuringRead"])
+        self.assertEqual(o["main"]["idleSeconds"], 1000)
+
 
 if __name__ == "__main__":
     unittest.main()
