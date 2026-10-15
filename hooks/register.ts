@@ -2,6 +2,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 const MIN = 60 * 1000
 const HOUR = 60 * MIN
+const DEFAULT_MAX_HOURS = 12
 const COLD_AFTER_MS = 60 * MIN
 const MAX_INTERVAL_MIN = 55
 const BIG_TOKENS = 50000
@@ -18,6 +19,7 @@ type State = {
   sid: string
   armed: boolean
   armedAt: number
+  windowStartAt: number
   lastPingAt: number
   lastActivityAt: number
   expiresAt: number
@@ -27,6 +29,7 @@ type State = {
   ctx: number
   intervalMs: number
   windowMs: number
+  maxMs: number
   guard: 'warn' | 'refuse'
   ackedAt: number
   note: string | null
@@ -35,15 +38,15 @@ type State = {
   stalled: StalledAgent[]
 }
 
-/** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00. Null for an unset time. */
-export function isoLocal(ms: number): string | null {
+/** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00; with `withMs`, 2026-10-14T22:39:00.123-07:00. Null for an unset time. */
+export function isoLocal(ms: number, withMs = false): string | null {
   if (!ms) return null
   const d = new Date(ms)
   const off = -d.getTimezoneOffset()
   const sign = off >= 0 ? '+' : '-'
   const abs = Math.abs(off)
   const p = (n: number, w = 2) => String(n).padStart(w, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${sign}${p(Math.floor(abs / 60))}:${p(abs % 60)}`
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${withMs ? '.' + p(d.getMilliseconds(), 3) : ''}${sign}${p(Math.floor(abs / 60))}:${p(abs % 60)}`
 }
 
 function epoch(ms: number): number | null {
@@ -53,9 +56,10 @@ function epoch(ms: number): number | null {
 export function stateFile(s: State, writtenAt: number): Record<string, unknown> {
   return {
     sessionId: s.sid,
-    writtenAt: isoLocal(writtenAt), writtenAtEpoch: epoch(writtenAt),
+    writtenAt: isoLocal(writtenAt, true), writtenAtEpoch: epoch(writtenAt), writtenAtEpochMs: writtenAt,
     armed: s.armed,
     armedAt: isoLocal(s.armedAt), armedAtEpoch: epoch(s.armedAt),
+    windowStartAt: isoLocal(s.windowStartAt), windowStartAtEpoch: epoch(s.windowStartAt),
     lastPingAt: isoLocal(s.lastPingAt), lastPingAtEpoch: epoch(s.lastPingAt),
     lastActivityAt: isoLocal(s.lastActivityAt), lastActivityAtEpoch: epoch(s.lastActivityAt),
     expiresAt: isoLocal(s.expiresAt), expiresAtEpoch: epoch(s.expiresAt),
@@ -67,6 +71,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     },
     intervalMin: s.intervalMs / MIN,
     windowHours: s.windowMs / HOUR,
+    maxHours: s.maxMs / HOUR,
     note: s.note,
     stallMin: s.stallMs / MIN,
     stallCheckMin: s.stallCheckMs / MIN,
@@ -92,8 +97,8 @@ function positive(text: string | undefined): number | null {
 
 export function freshState(): State {
   return {
-    sid: '', armed: false, armedAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
-    lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: 3 * HOUR, guard: 'warn', ackedAt: 0, note: null,
+    sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
+    lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: 3 * HOUR, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
   }
 }
@@ -101,12 +106,13 @@ export function freshState(): State {
 /**
  * The session id as a file name, reversible so two ids never share a file: letters, digits, `_` and `-` stay,
  * every other character becomes %XX per UTF-8 byte (so `%` itself, `.` and `/` are encoded too).
+ * A lone UTF-16 surrogate has no UTF-8 encoding and is replaced by U+FFFD (`%EF%BF%BD`), so two ids that differ only in lone surrogates share a file.
  */
 export function safeName(sid: string): string {
   return Array.from(sid).map(ch => {
     if (/[A-Za-z0-9_-]/.test(ch)) return ch
     let enc: string
-    try { enc = encodeURIComponent(ch) } catch { return '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') } // a lone surrogate
+    try { enc = encodeURIComponent(ch) } catch { enc = '%EF%BF%BD' } // a lone UTF-16 surrogate has no UTF-8 bytes: it becomes U+FFFD
     return enc.replace(/[!'()*.~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))
   }).join('')
 }
@@ -120,15 +126,21 @@ let pinging = false
 let writes: Promise<void> = Promise.resolve()
 /** True while an `<id>.error.json` from a failed write sits beside the state file. */
 let errorFileWritten = false
+/** Set when neither the state file nor the error file could be written and the old state file could not be removed; shown in the status line. */
+let durabilityNote: string | null = null
+/** Tool calls started and not finished, per agent id ('' is the main conversation). A subagent with one in flight is working, not silent. */
+const inFlight = new Map<string, number>()
 
 /** Forget everything about the session that was running, keep the configuration. Used on session.end and on a changed session id. */
 function resetSession() {
   cancel()
   stopStall()
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs })
   lastEventAt.clear()
   errorFileWritten = false
+  inFlight.clear()
+  durabilityNote = null
 }
 
 /** /clear fires session.end but no session.start; every event handler calls this so the id is always the live one. */
@@ -137,7 +149,6 @@ async function ensureSession($: EngineInterface) {
   if (s.sid === id) return
   if (s.sid) resetSession()
   s.sid = id
-  if (!stallTimer) scheduleStall($)
 }
 
 // The file is written beside its final name and moved over it, so a reader never sees half a file.
@@ -151,13 +162,14 @@ function persist($: EngineInterface) {
       const dir = `${home}/.claude/bun-warmer`
       const safe = safeName(s.sid)
       const tmp = `${dir}/.${safe}.json.tmp`
+      const final = `${dir}/${safe}.json`
       const errPath = `${dir}/${safe}.error.json`
       const sid = s.sid
       const now = await $.clock.now()
       let failure: string | null = null
       try {
         await $.fs.write(tmp, JSON.stringify(stateFile(s, now), null, 2) + '\n')
-        const moved = await $.process.run(['mv', '-f', tmp, `${dir}/${safe}.json`])
+        const moved = await $.process.run(['mv', '-f', tmp, final])
         if (moved.exitCode !== 0) failure = `mv failed: ${moved.stderr.trim() || `exit ${moved.exitCode}`}`
       } catch (err) {
         failure = `write failed: ${err instanceof Error ? err.message : String(err)}`
@@ -165,11 +177,35 @@ function persist($: EngineInterface) {
       if (failure) {
         $.ui.log(`bun-warmer: could not write the state file (${failure})`)
         try { await $.process.run(['rm', '-f', tmp]) } catch { /* nothing more to do */ }
-        await $.fs.write(errPath, JSON.stringify({ sessionId: sid, failedAt: isoLocal(now), failedAtEpoch: epoch(now), error: failure }, null, 2) + '\n')
-        errorFileWritten = true
-      } else if (errorFileWritten) {
-        await $.process.run(['rm', '-f', errPath])
-        errorFileWritten = false
+        let errWritten = false
+        try {
+          await $.fs.write(errPath, JSON.stringify({ sessionId: sid, failedAt: isoLocal(now, true), failedAtEpoch: epoch(now), failedAtEpochMs: now, error: failure }, null, 2) + '\n')
+          errWritten = true
+        } catch (err) {
+          $.ui.log(`bun-warmer: could not write the error file either (${err instanceof Error ? err.message : String(err)})`)
+        }
+        if (errWritten) {
+          errorFileWritten = true
+          durabilityNote = null
+        } else {
+          // Nothing durable says the write failed, so an old final file would pass for current. Remove it.
+          let removed = false
+          try { removed = (await $.process.run(['rm', '-f', final])).exitCode === 0 } catch { /* handled below */ }
+          if (removed) {
+            durabilityNote = null
+            $.ui.log('bun-warmer: removed the old state file so it cannot pass for current')
+          } else {
+            durabilityNote = 'STATE FILE NOT WRITTEN and the old one could not be removed, so it is stale'
+            $.ui.log(`bun-warmer: ${durabilityNote}`)
+          }
+          status($, now)
+        }
+      } else {
+        if (durabilityNote) { durabilityNote = null; status($, now) }
+        if (errorFileWritten) {
+          await $.process.run(['rm', '-f', errPath])
+          errorFileWritten = false
+        }
       }
     } catch (err) {
       $.ui.log(`bun-warmer: could not record a state file failure (${err instanceof Error ? err.message : String(err)})`)
@@ -179,12 +215,13 @@ function persist($: EngineInterface) {
 }
 
 function status($: EngineInterface, now: number) {
-  if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}` : stallText().slice(3) || undefined)
+  const dur = durabilityNote ? ` · ${durabilityNote}` : ''
+  if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3) || undefined)
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
   const next = !base ? 'waiting for the first turn' : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity' : `ping in ${fmtDur(base + s.intervalMs - now)}`
-  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}`)
+  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
 }
 
 function stallText(): string {
@@ -210,18 +247,25 @@ function schedule($: EngineInterface, now: number) {
 
 async function disarm($: EngineInterface, why: string) {
   cancel()
+  stopStall()
   s.armed = false
+  s.stalled = []
   s.note = why
   const now = await $.clock.now()
   status($, now)
   await persist($)
 }
 
-async function arm($: EngineInterface, now: number) {
+/**
+ * Open or restart the window. `extend` keeps the window start of the current arm: an extension (busy session at expiry)
+ * can never reach past windowStartAt + maxMs. A new arm (session start, a typed prompt, /bunwarm on) starts a new window.
+ */
+async function arm($: EngineInterface, now: number, extend = false) {
+  if (!extend || !s.armed) { s.windowStartAt = now; s.armedAt = now }
   s.armed = true
-  s.armedAt = now
-  s.expiresAt = now + s.windowMs
+  s.expiresAt = Math.min(now + s.windowMs, s.windowStartAt + s.maxMs)
   s.note = null
+  if (!stallTimer) scheduleStall($)
   schedule($, now)
   status($, now)
   await persist($)
@@ -230,7 +274,8 @@ async function arm($: EngineInterface, now: number) {
 async function hasActiveAgents($: EngineInterface): Promise<boolean> {
   try {
     const list = await $.agent.list()
-    return list.some(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting')
+    // Only `running` is work in progress; `pending` and `waiting` (e.g. a plan awaiting approval) can sit forever.
+    return list.some(a => a.status === 'running')
   } catch {
     return false
   }
@@ -252,6 +297,7 @@ function stallMessage(a: StalledAgent): string {
  * own prompt.submit hook is skipped by the engine, so the guard cannot drop it.
  */
 export async function stallCheck($: EngineInterface) {
+  if (!s.armed) return
   let list
   try {
     list = await $.agent.list()
@@ -263,6 +309,8 @@ export async function stallCheck($: EngineInterface) {
   for (const a of list) {
     if (!a || !a.id || a.status !== 'running') continue
     running.set(a.id, { description: a.description, type: a.type })
+    // A tool call in flight is work, however long it takes: the agent is not silent.
+    if ((inFlight.get(a.id) ?? 0) > 0) lastEventAt.set(a.id, now)
     // An agent never seen producing an event is measured from the first time the watchdog saw it running.
     if (!lastEventAt.has(a.id)) lastEventAt.set(a.id, now)
   }
@@ -288,6 +336,7 @@ export async function stallCheck($: EngineInterface) {
     changed = true
   }
   for (const f of fresh) {
+    if (!s.armed) break
     try {
       const r = await Promise.race([
         $.prompt.submit({ text: stallMessage(f) }),
@@ -322,7 +371,9 @@ async function tick($: EngineInterface) {
   const now = await $.clock.now()
   if (now >= s.expiresAt) {
     // Subagents working or turns still arriving mean the session is busy, not finished.
-    if (now - s.lastActivityAt < s.intervalMs || await hasActiveAgents($)) return arm($, now)
+    const capAt = s.windowStartAt + s.maxMs
+    if (now >= capAt) return disarm($, `maximum of ${fmtDur(s.maxMs)} reached`)
+    if (now - s.lastActivityAt < s.intervalMs || await hasActiveAgents($)) return arm($, now, true)
     return disarm($, 'window expired')
   }
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
@@ -374,6 +425,8 @@ async function ping($: EngineInterface, now: number) {
 
 async function activity($: EngineInterface, human: boolean) {
   const now = await $.clock.now()
+  // The ping's own model call is not the session's activity: lastActivityAt tells a reader when work last happened.
+  if (pinging && !human) return
   s.lastActivityAt = now
   if (human) return arm($, now)
   if (s.armed) schedule($, now)
@@ -399,13 +452,13 @@ export const register: Register = (on, options) => {
     const optWindow = typeof options.windowHours === 'number' && options.windowHours > 0 ? options.windowHours : 3
     s.intervalMs = Math.min(envInterval ?? optInterval, MAX_INTERVAL_MIN) * MIN
     s.windowMs = (envWindow ?? optWindow) * HOUR
+    s.maxMs = (positive(await $.env.get('BUN_WARMER_MAX_HOURS')) ?? DEFAULT_MAX_HOURS) * HOUR
     s.stallMs = (positive(await $.env.get('BUN_WARMER_STALL_MIN')) ?? 20) * MIN
     s.stallCheckMs = (positive(await $.env.get('BUN_WARMER_STALL_CHECK_MIN')) ?? 5) * MIN
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
     await arm($, await $.clock.now())
-    scheduleStall($)
     return r
   })
 
@@ -485,7 +538,19 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     try { await ensureSession($) } catch { /* the id is advisory here */ }
+    const key = e.agentId ?? ''
     try { touchAgent(e.agentId, await $.clock.now()) } catch { /* a stall clock must never block a tool call */ }
-    return next(e)
+    inFlight.set(key, (inFlight.get(key) ?? 0) + 1)
+    try {
+      return await next(e)
+    } finally {
+      const left = (inFlight.get(key) ?? 1) - 1
+      if (left > 0) inFlight.set(key, left); else inFlight.delete(key)
+      // Completion is activity too: the clock restarts when the tool ends, not only when it began.
+      try {
+        touchAgent(e.agentId, await $.clock.now())
+        await activity($, false)
+      } catch { /* never fail a tool call over bookkeeping */ }
+    }
   })
 }
