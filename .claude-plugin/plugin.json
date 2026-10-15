@@ -1,0 +1,27 @@
+{
+  "name": "bun-warmer",
+  "version": "0.1.0",
+  "author": { "name": "Eugenia Wang" },
+  "description": "Keeps the prompt cache warm with a periodic ping, counts subagent work as activity, never blocks a prompt a human did not type, and writes a state file for a close hook. Inspired by cache-tax by Karan Bansal (MIT).",
+  "userConfig": {
+    "intervalMin": {
+      "type": "number",
+      "title": "Ping interval (minutes)",
+      "description": "Minutes of quiet before a ping. Default 50; the cache goes cold after 60, so values above 55 are capped. Env BUN_WARMER_INTERVAL_MIN overrides.",
+      "default": 50
+    },
+    "windowHours": {
+      "type": "number",
+      "title": "Window (hours)",
+      "description": "How long pings continue after the last human prompt. Default 3. Env BUN_WARMER_WINDOW_HOURS overrides.",
+      "default": 3
+    },
+    "guard": {
+      "type": "string",
+      "title": "Cold-send guard",
+      "description": "warn only shows a note when you type a prompt into a cold session. refuse drops your own first send once. Never applies to subagent or other non-human prompts.",
+      "default": "warn",
+      "options": ["warn", "refuse"]
+    }
+  }
+}
