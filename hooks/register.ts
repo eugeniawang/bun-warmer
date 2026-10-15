@@ -7,6 +7,8 @@ const COLD_AFTER_MS = 60 * MIN
 const MAX_INTERVAL_MIN = 55
 const BIG_TOKENS = 50000
 const PING_PROMPT = 'Reply with the single word: warm'
+const DEFAULT_ACTIVE_START = 6
+const DEFAULT_ACTIVE_END = 23
 
 /** Prompt origins that are a person typing. Everything else (subagent returns, task notifications, peers, schedules, plugins, the SDK) is never blocked. */
 const HUMAN_ORIGINS = ['composer', 'bridge']
@@ -36,6 +38,14 @@ type State = {
   stallMs: number
   stallCheckMs: number
   stalled: StalledAgent[]
+  /** Quiet hours: pings go out only while the machine's local hour is in [activeStart, activeEnd). Off: pings run around the clock (still bounded by the window). */
+  quietEnabled: boolean
+  activeStart: number
+  activeEnd: number
+  skippedQuiet: number
+  lastSkippedAt: number
+  /** No ping before this time (the end of the quiet stretch a skip happened in). 0 when none. */
+  notBefore: number
 }
 
 /** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00; with `withMs`, 2026-10-14T22:39:00.123-07:00. Null for an unset time. */
@@ -75,6 +85,9 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     note: s.note,
     stallMin: s.stallMs / MIN,
     stallCheckMin: s.stallCheckMs / MIN,
+    quietHours: { enabled: s.quietEnabled, activeStartHour: s.activeStart, activeEndHour: s.activeEnd },
+    skippedQuiet: s.skippedQuiet,
+    lastSkippedAt: isoLocal(s.lastSkippedAt), lastSkippedAtEpoch: epoch(s.lastSkippedAt),
     stalledAgents: s.stalled.map(a => ({
       id: a.id, description: a.description, type: a.type, minutesSilent: a.minutesSilent,
       firstFlaggedAt: isoLocal(a.firstFlaggedAt), firstFlaggedAtEpoch: epoch(a.firstFlaggedAt), messageSent: a.messageSent,
@@ -89,6 +102,48 @@ function fmtDur(ms: number): string {
   return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`
 }
 
+/** An hour 0-23 from an environment string; anything else (unset, empty, 6.5, 24, text) is the default. */
+export function hourSetting(text: string | undefined, fallback: number): number {
+  if (text === undefined || !/^\s*\d{1,2}\s*$/.test(text)) return fallback
+  const n = Number(text)
+  return n >= 0 && n <= 23 ? n : fallback
+}
+
+/** Only the exact word `off` (any case) disables the schedule. */
+export function quietHoursOff(text: string | undefined): boolean {
+  return text !== undefined && text.trim().toLowerCase() === 'off'
+}
+
+/**
+ * True when the local hour of `ms` falls in [start, end) of the machine's local clock, read with the Date local getters.
+ * start > end wraps midnight (22 to 6 is 22:00-23:59 and 00:00-05:59); start === end is no restriction at all.
+ */
+export function inActiveHours(ms: number, start: number, end: number): boolean {
+  if (start === end) return true
+  const h = new Date(ms).getHours()
+  return start < end ? h >= start && h < end : h >= start || h < end
+}
+
+/** The first moment at or after `ms` that is inside active hours. Built from local calendar fields, so a DST change moves it with the wall clock. */
+export function nextActiveMoment(ms: number, start: number, end: number): number {
+  if (inActiveHours(ms, start, end)) return ms
+  const d = new Date(ms)
+  let t = new Date(d.getFullYear(), d.getMonth(), d.getDate(), start, 0, 0, 0).getTime()
+  if (t <= ms) t = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, start, 0, 0, 0).getTime()
+  // A start hour skipped by a spring-forward lands in the next hour; step on until a moment is really active.
+  for (let i = 0; i < 48 && !inActiveHours(t, start, end); i++) t += HOUR
+  return t
+}
+
+function isQuiet(ms: number): boolean {
+  return s.quietEnabled && !inActiveHours(ms, s.activeStart, s.activeEnd)
+}
+
+function hhmm(ms: number): string {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 function positive(text: string | undefined): number | null {
   if (text === undefined) return null
   const n = Number(text)
@@ -100,6 +155,7 @@ export function freshState(): State {
     sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
     lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: 3 * HOUR, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
+    quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0,
   }
 }
 
@@ -147,7 +203,7 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd })
   lastEventAt.clear()
   errorFileWritten = false
   inFlight.clear()
@@ -234,7 +290,10 @@ function status($: EngineInterface, now: number) {
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
-  const next = !base ? 'waiting for the first turn' : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity' : `ping in ${fmtDur(base + s.intervalMs - now)}`
+  const next = !base ? 'waiting for the first turn'
+    : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
+    : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity'
+    : `ping in ${fmtDur(Math.max(base + s.intervalMs, s.notBefore) - now)}`
   return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
 }
 
@@ -254,7 +313,8 @@ function schedule($: EngineInterface, now: number) {
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
   const coldAt = base ? base + COLD_AFTER_MS : 0
   // A cold cache is not pinged: that would pay the full rewrite. Only expiry is watched until activity returns.
-  const pingAt = base && now < coldAt ? base + s.intervalMs : s.expiresAt
+  // A ping skipped for quiet hours leaves notBefore: the next one waits for active hours or the normal interval, whichever is later.
+  const pingAt = base && now < coldAt ? Math.max(base + s.intervalMs, s.notBefore) : s.expiresAt
   const due = Math.min(pingAt, s.expiresAt)
   timer = $.clock.after(Math.max(1000, due - now), () => { tick($).catch(err => safeLog($, `tick failed (${errText(err)})`)) })
 }
@@ -422,6 +482,16 @@ async function tick($: EngineInterface) {
     schedule($, now)
     return status($, now)
   }
+  if (isQuiet(now)) {
+    // Due during quiet hours: skipped, not failed. Not a refusal, lastPing untouched; the cache may go cold on purpose.
+    s.skippedQuiet++
+    s.lastSkippedAt = now
+    s.notBefore = Math.max(nextActiveMoment(now, s.activeStart, s.activeEnd), now + s.intervalMs)
+    schedule($, now)
+    status($, now)
+    await persist($)
+    return
+  }
   await ping($, now)
 }
 
@@ -462,6 +532,7 @@ async function ping($: EngineInterface, now: number) {
   s.lastPing = result
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
+  s.notBefore = 0
   if (!result.ok) s.refusals++
   schedule($, now)
   status($, now)
@@ -480,6 +551,7 @@ async function activity($: EngineInterface, human: boolean, agentId?: string) {
   // one carrying the id of a listed subagent is that subagent's own work and counts.
   if (pinging && !human && !(agentId && await isListedAgent($, agentId))) return
   s.lastActivityAt = now
+  s.notBefore = 0
   if (human) return arm($, now)
   if (s.armed) schedule($, now)
   status($, now)
@@ -507,6 +579,9 @@ export const register: Register = (on, options) => {
     s.maxMs = (positive(await $.env.get('BUN_WARMER_MAX_HOURS')) ?? DEFAULT_MAX_HOURS) * HOUR
     s.stallMs = (positive(await $.env.get('BUN_WARMER_STALL_MIN')) ?? 20) * MIN
     s.stallCheckMs = (positive(await $.env.get('BUN_WARMER_STALL_CHECK_MIN')) ?? 5) * MIN
+    s.quietEnabled = !quietHoursOff(await $.env.get('BUN_WARMER_QUIET_HOURS'))
+    s.activeStart = hourSetting(await $.env.get('BUN_WARMER_ACTIVE_START'), DEFAULT_ACTIVE_START)
+    s.activeEnd = hourSetting(await $.env.get('BUN_WARMER_ACTIVE_END'), DEFAULT_ACTIVE_END)
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
@@ -543,7 +618,7 @@ export const register: Register = (on, options) => {
     if (word === 'on') { await arm($, now); return { text: `bun-warmer on for ${fmtDur(s.windowMs)}, a ping after ${fmtDur(s.intervalMs)} of quiet` } }
     if (!s.armed) return { text: `bun-warmer is off${s.note ? ` (${s.note})` : ''}` }
     const fail = s.lastPing && !s.lastPing.ok ? `; last ping FAILED: ${s.lastPing.reason}` : s.lastPing ? '; last ping ok' : ''
-    return { text: `bun-warmer on, ${fmtDur(s.expiresAt - now)} left, ${s.refusals} failed or refused pings${fail}` }
+    return { text: `bun-warmer on, ${fmtDur(s.expiresAt - now)} left, ${s.refusals} failed or refused pings${s.skippedQuiet ? `, ${s.skippedQuiet} skipped for quiet hours` : ''}${fail}` }
   })
 
   on('prompt.submit', async ($, e, next) => {

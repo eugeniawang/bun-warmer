@@ -21,6 +21,26 @@ Requires Claude Code 2.1.300 or newer (function hooks, early-access API).
 
 Timer callbacks (the ping timer and the watchdog timer) have rejection handlers that log `bun-warmer: tick failed (...)` or `stall check failed (...)` through a logger that never throws, so a clock or UI call that fails during teardown cannot become an unhandled rejection. No automated test covers this: the test kit lets one hook answer `clock.now` and `mock.clock` holds it.
 
+## Quiet hours
+
+Pings go out only during the day, 06:00 to 23:00 in the local time of the machine the session runs on (not a fixed zone). The mod reads the time with `$.clock.now()` (epoch milliseconds) and turns it into an hour with the JavaScript `Date` local getters (`getHours`). Confirmed: the unit tests, which build every time from local calendar fields, pass under `TZ=America/Los_Angeles`, `UTC`, `Asia/Kolkata` and `Australia/Lord_Howe`, so the module follows the process zone, including DST. Not checked: a live Claude Code session. The types file offers no zone-aware clock call, so a host that ran the mod in a sandbox with a different zone than the machine would shift the hours.
+
+Quiet hours are a second limit on top of the window, never a replacement for it. A session pings only while it is within the window (default 3 hours) of its last real activity; a ping never extends the window (the ping's own model call is not activity); subagent activity still extends it. A session started at 07:00 and left idle pings at 07:50, 08:40 and 09:30 and then stops, not at 23:00 (the test `a session started at 07:00 and left idle stops pinging 3 hours after its last activity` covers this).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| env `BUN_WARMER_ACTIVE_START` | 6 | First active hour, 0-23 |
+| env `BUN_WARMER_ACTIVE_END` | 23 | First quiet hour, 0-23, exclusive (23 means the last ping is allowed at 22:59) |
+| env `BUN_WARMER_QUIET_HOURS` | on | `off` turns the schedule off and pings run around the clock, still inside the window |
+
+A start greater than the end wraps midnight (22 and 6 means active from 22:00 to 05:59). A start equal to the end means no restriction. A value that is not a whole number from 0 to 23 is ignored and the default is used.
+
+A ping that comes due during quiet hours is skipped: `skippedQuiet` goes up by one, `lastSkippedAt` records when, and the status line says `quiet hours, pings resume 06:00`. A skip is not a failure and not a refusal: `refusals` and `lastPing` are not touched. The next ping is scheduled for the first moment inside active hours or the normal interval after the skip, whichever is later. Because a cache that has been idle for 60 minutes is never pinged, a skipped ping normally means the cache goes cold, and the next ping happens only after new activity. `expiresAt` in the state file is still the end of the window, unchanged by quiet hours.
+
+What this means for overnight orchestrator runs: the cache is allowed to go cold on purpose. An orchestrator that works through the night with subagents keeps the session busy, but Bun Warmer sends no pings between 23:00 and 06:00, so the cache expires after 60 minutes without a model call. The guard does not drop non-human messages (subagent returns, task notifications, schedules, the SDK) and quiet hours do not change the guard at all (default `warn`). The first message a person types the next morning pays one re-warm of the whole context at the cache-write rate.
+
+Pings that resume at 06:00 need both an open window and a warm cache. An overnight run whose subagents are still active at 05:30 and whose window is open does get a ping at 06:20.
+
 ## Stall watchdog
 
 While a session has subagents, a second timer (separate from the ping) checks `$.agent.list()` every `BUN_WARMER_STALL_CHECK_MIN` minutes (default 5). The call is local and costs no tokens. A subagent whose status is `running` and that has produced no event (turn step, turn completion, tool call start or finish) and has no tool call in flight for `BUN_WARMER_STALL_MIN` minutes (default 20) is stalled. A tool call that has started and not finished counts as active for as long as it runs, however long, and its completion restarts the clock; a model step that streams for a long time without a tool call can still look quiet. An agent never seen producing an event is timed from the first check that saw it running. The watchdog never stops or kills anything. It runs only while the mod is armed: `/bunwarm off`, window expiry, `/clear` and session end all stop its timer (and clear its stalled list), and `/bunwarm on` or a typed prompt starts it again.
@@ -40,6 +60,7 @@ Not chosen: `$.session.append` adds a user-role row but starts no turn, so an id
 | Ping interval | 50 minutes (capped at 55) | env `BUN_WARMER_INTERVAL_MIN`, else `userConfig` field `intervalMin` |
 | Window | 3 hours | env `BUN_WARMER_WINDOW_HOURS`, else `userConfig` field `windowHours` |
 | Guard | `warn` | `userConfig` field `guard` (`warn` or `refuse`) |
+| Active hours | 06:00 to 23:00 local | env `BUN_WARMER_ACTIVE_START`, `BUN_WARMER_ACTIVE_END`, `BUN_WARMER_QUIET_HOURS=off` (see Quiet hours) |
 | Stall threshold | 20 minutes | env `BUN_WARMER_STALL_MIN` |
 | Stall check interval | 5 minutes | env `BUN_WARMER_STALL_CHECK_MIN` |
 | Hard cap on window extension | 12 hours | env `BUN_WARMER_MAX_HOURS` |
@@ -72,6 +93,9 @@ Double failure: if the error file cannot be written either, the mod tries to rem
   "expiresAt": "…",                              "expiresAtEpoch": 0,
   "refusals": 0,
   "guardDrops": 0,
+  "quietHours": { "enabled": true, "activeStartHour": 6, "activeEndHour": 23 },
+  "skippedQuiet": 0,
+  "lastSkippedAt": null,                          "lastSkippedAtEpoch": null,
   "lastPing": { "at": "…", "atEpoch": 0, "ok": true, "reason": null, "cacheReadTokens": 0, "cacheWriteTokens": 0 },
   "intervalMin": 50,
   "windowHours": 3,
@@ -127,3 +151,5 @@ Not proven by the unit tests: that a real orchestrator reads the message while i
 claude plugin validate .
 claude plugin test .
 ```
+
+The suites build every time from local calendar fields, so run them under more than one zone, for example `TZ=America/Los_Angeles claude plugin test .` and `TZ=UTC claude plugin test .`.

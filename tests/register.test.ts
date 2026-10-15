@@ -24,7 +24,8 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   let sid = 'S1'
   let ctxTokens = 200000
   const fail = { mv: false, write: false, errWrite: false, rmFinal: false, rmErr: false }
-  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
+  // These tests predate quiet hours and run at an arbitrary hour of the machine's day: quiet hours stay off unless a test sets them. tests/quiet.test.ts covers them.
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
   on('fs.write', ($, e) => {
     if (fail.write && e.path.endsWith('.tmp')) throw new Error('disk full')
     if (fail.errWrite && e.path.endsWith('.error.json')) throw new Error('disk full')
