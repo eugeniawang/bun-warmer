@@ -12,6 +12,8 @@ Requires Claude Code 2.1.300 or newer (function hooks, early-access API).
 - A cold cache (60 minutes since any activity) is never pinged, because that would pay the full rewrite.
 - Subagent activity counts as main-session activity. Any turn step or turn completion carrying an `agentId` updates `lastActivityAt`. At window expiry the window is extended instead of closed while turns arrived within the last interval or a subagent is running, pending or waiting.
 - The cold-send guard only ever looks at prompts a person typed (origin `composer` or `bridge`). Every other origin passes through untouched: `sdk`, `task-notification`, `scheduled-trigger`, `peer`, `peer-send-message`, `projects-relay`, `channel`, `coordinator`, `observer`, `observer-activity`, `auto-continuation`, `unclassified`, `slack-ping`, `plugin`. The default guard mode is `warn` (a note with the token count, never a drop). `refuse` is opt-in and drops only a human first send once.
+- `/clear` ends the session without a `session.start`. Bun Warmer resets everything about the old session (context size, activity times, ping record, counters, stalled agents), leaves the old session's state file as `armed: false` with `note: "cleared"`, and takes the new session id from the next event it sees. It stays disarmed until you type a prompt. The same reset runs on resume and whenever an event arrives under a session id different from the one it holds.
+- Compaction (`session.compact`, main conversation only, not a skip) clears the remembered context size and the guard's acknowledgement, so the cold-send guard cannot act on the pre-compaction count. The size is set again only by the next response (`turn.complete`).
 - A ping that fails, is refused, or finds the cache already gone is recorded as failed in the state file and shown in the status line. It is never reported as success.
 - The mod does not know model prices, so the guard note shows the token count that would be re-written, not a dollar figure.
 
@@ -41,11 +43,18 @@ Slash command: `/bunwarm` shows status, `/bunwarm off` stops it for this session
 
 ## State file
 
-`~/.claude/bun-warmer/<session-id>.json`, rewritten on every arm, disarm, ping and activity event. It is written as a temporary file beside it and moved into place with `mv`, so a reader never sees half a file.
+`~/.claude/bun-warmer/<file-name>.json`, rewritten on every arm, disarm, ping and activity event. It is written as a temporary file beside it and moved into place with `mv`, so a reader never sees half a file.
+
+File name rule (a reader such as `close-on-stop.sh` must apply it to a session id): keep the characters `A-Z a-z 0-9 _ -`; replace every other character with `%` plus two uppercase hex digits per UTF-8 byte (`a/b` becomes `a%2Fb`, `a?b` becomes `a%3Fb`, `%` becomes `%25`, `.` becomes `%2E`). The mapping is reversible, so two session ids never share a file. A UUID session id is unchanged. The temp file is `.<file-name>.json.tmp`.
+
+Staleness: every file carries `writtenAt` and `writtenAtEpoch`, the time of that write. A reader that finds `writtenAt` older than the interval should treat the file as old, not current.
+
+Write failures: if the write or the `mv` fails, the temp file is removed, the failure is logged, and `<file-name>.error.json` is written beside the state file with `sessionId`, `failedAt`, `failedAtEpoch` and `error`. The previous state file is left as it was (its `writtenAt` shows how old it is). The next successful write deletes the error file. If the error file itself cannot be written, only the log line remains.
 
 ```json
 {
   "sessionId": "…",
+  "writtenAt": "…", "writtenAtEpoch": 0,
   "armed": true,
   "armedAt": "2026-10-14T22:39:00-07:00",        "armedAtEpoch": 1792042740,
   "lastPingAt": "2026-10-14T23:29:00-07:00",     "lastPingAtEpoch": 1792045740,
@@ -65,7 +74,7 @@ Slash command: `/bunwarm` shows status, `/bunwarm off` stops it for this session
 }
 ```
 
-Time fields are `null` until they have happened. `refusals` counts pings that failed or were refused (including a ping that found the cache already gone). `guardDrops` counts prompts dropped by the opt-in refuse guard. `armed` is false after the window expires, `/bunwarm off`, `/clear` or session end, and `note` says which.
+Time fields are `null` until they have happened. `refusals` counts pings that failed or were refused (including a ping that found the cache already gone). `guardDrops` counts prompts dropped by the opt-in refuse guard. `armed` is false after the window expires, `/bunwarm off`, `/clear` or session end, and `note` says which. After `/clear` the old session's file keeps `armed: false`, `note: "cleared"`; the new session writes its own file under its own id.
 
 ## Install
 
