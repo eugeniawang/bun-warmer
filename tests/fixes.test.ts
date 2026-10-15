@@ -127,7 +127,8 @@ describe('stall message is deferred while the main loop is busy', () => {
     await clock.advance(30 * MIN)
     const m = w.sent[0]
     expect(m).toMatch(/^Bun Warmer notice sent at \d\d:\d\d local time, ignore if you have since run \/bunwarm off or the subagent already finished\./)
-    expect(m).toContain('build thing (a1)')
+    expect(m).toContain('with id a1 ')
+    expect(m).not.toContain('build thing')
     expect(m).toMatch(/silent for \d+ minutes/)
     expect(m).not.toMatch(/Decide: wait, stop it/)
   })

@@ -294,6 +294,92 @@ class T(unittest.TestCase):
         self.assertFalse(o["main"]["grewDuringRead"])
         self.assertEqual(o["main"]["idleSeconds"], 1000)
 
+    def _read_with_mutation(self, path, mutate, stat_fails=False):
+        """Run file_info with `mutate()` fired right after the first fstat, i.e. in the middle of the read."""
+        spec = importlib.util.spec_from_file_location("sp_mut", SCRIPT)
+        sp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sp)
+        real_fstat = os.fstat
+        calls = []
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            calls.append(1)
+            if len(calls) == 1:
+                mutate()
+            return st
+
+        def stat(p, *a, **k):
+            raise OSError("gone")
+
+        sp.os = type("O", (), {})()
+        for k in dir(os):
+            setattr(sp.os, k, getattr(os, k))
+        sp.os.fstat = fstat
+        if stat_fails:
+            sp.os.stat = stat
+        return sp.file_info(path, NOW, 5, None, False)
+
+    def _assert_uncertain(self, info, reason):
+        self.assertTrue(info["uncertain"])
+        self.assertEqual(info["reason"], reason)
+        self.assertEqual(info["idleSeconds"], 0)
+
+    def test_truncation_during_read_is_uncertain_not_quiet(self):
+        path = self.e.main([text(), text(), text()], idle=1000)
+
+        def shrink():
+            with open(path, "r+b") as f:
+                f.truncate(5)
+            os.utime(path, (NOW - 1000, NOW - 1000))
+
+        self._assert_uncertain(self._read_with_mutation(path, shrink), "shrank")
+
+    def test_file_replaced_during_read_is_uncertain_not_quiet(self):
+        path = self.e.main([text()], idle=1000)
+
+        def replace():
+            other = path + ".new"
+            with open(other, "wb") as f:
+                f.write((json.dumps(text()) + "\n").encode())
+            os.utime(other, (NOW - 1000, NOW - 1000))
+            os.replace(other, path)
+
+        self._assert_uncertain(self._read_with_mutation(path, replace), "replaced")
+
+    def test_symlink_swapped_during_read_is_uncertain_not_quiet(self):
+        path = self.e.main([text()], idle=1000)
+        target = os.path.join(self.e.td.name, "other.jsonl")
+        with open(target, "wb") as f:
+            f.write((json.dumps(text()) + "\n").encode())
+        os.utime(target, (NOW - 1000, NOW - 1000))
+
+        def swap():
+            os.unlink(path)
+            os.symlink(target, path)
+
+        self._assert_uncertain(self._read_with_mutation(path, swap), "replaced")
+
+    def test_same_size_rewrite_during_read_is_uncertain_not_quiet(self):
+        path = self.e.main([text()], idle=1000)
+
+        def touch():
+            os.utime(path, (NOW - 3, NOW - 3))
+
+        info = self._read_with_mutation(path, touch)
+        self._assert_uncertain(info, "modified")
+        self.assertTrue(info["grewDuringRead"])
+
+    def test_unreadable_second_stat_is_uncertain_not_quiet(self):
+        path = self.e.main([text()], idle=1000)
+        self._assert_uncertain(self._read_with_mutation(path, lambda: None, stat_fails=True), "restat-failed")
+
+    def test_clean_read_is_not_uncertain(self):
+        self.e.main([text()], idle=1000)
+        o = self.e.pulse()
+        self.assertFalse(o["main"]["uncertain"])
+        self.assertIsNone(o["main"]["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

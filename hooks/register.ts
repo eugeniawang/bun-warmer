@@ -112,7 +112,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     skippedQuiet: s.skippedQuiet,
     lastSkippedAt: isoLocal(s.lastSkippedAt), lastSkippedAtEpoch: epoch(s.lastSkippedAt),
     stalledAgents: s.stalled.map(a => ({
-      id: a.id, description: a.description, type: a.type, minutesSilent: a.minutesSilent,
+      id: safeId(a.id), description: a.description, type: safeType(a.type), minutesSilent: a.minutesSilent,
       firstFlaggedAt: isoLocal(a.firstFlaggedAt), firstFlaggedAtEpoch: epoch(a.firstFlaggedAt), messageSent: a.messageSent,
     })),
   }
@@ -332,7 +332,7 @@ function status($: EngineInterface, now: number) {
 
 function stallText(): string {
   if (!s.stalled.length) return ''
-  return ` · STALLED: ${s.stalled.map(a => `${a.description} ${a.minutesSilent}m`).join(', ')}`
+  return ` · STALLED: ${s.stalled.map(a => `${safeId(a.id)} ${Math.trunc(a.minutesSilent)}m`).join(', ')}`
 }
 
 function cancel() {
@@ -397,8 +397,28 @@ function touchAgent(id: string | undefined, now: number) {
 
 /** Starts with a notice that is harmless if it arrives late: it names the time, says when to ignore it, and suggests nothing destructive. */
 export const STALL_PREFIX = 'Bun Warmer notice sent at '
+
+/** Agent types known to the engine. Anything else is shown as `agent`: a type string comes from spawn metadata and is never trusted. */
+const KNOWN_AGENT_TYPES = ['general-purpose', 'Explore', 'Plan', 'claude', 'claude-code-guide', 'statusline-setup'] as const
+
+/** An agent id as text that cannot carry instructions: only letters, digits, `_` and `-`, at most 40 characters, anything else becomes `_`. */
+export function safeId(id: unknown): string {
+  return String(id ?? '').slice(0, 40).replace(/[^A-Za-z0-9_-]/g, '_')
+}
+
+export function safeType(type: unknown): string {
+  return KNOWN_AGENT_TYPES.find(t => t === type) ?? 'agent'
+}
+
+/** Free text kept only in the state file: printable ASCII from a short set, 80 characters at most. Never put in a model prompt or the status line. */
+export function safeDescription(text: unknown): string {
+  return String(text ?? '').slice(0, 80).replace(/[^A-Za-z0-9 _.,:;()-]/g, '?')
+}
+
+/** Fixed text plus an id, an allowlisted type, whole minutes and a time: no free text from the agent's spawn metadata. */
 function stallMessage(a: StalledAgent, sentAt: number): string {
-  return `${STALL_PREFIX}${hhmm(sentAt)} local time, ignore if you have since run /bunwarm off or the subagent already finished. Subagent ${a.description} (${a.id}) had shown running but silent for ${a.minutesSilent} minutes at that time. Suggested, non-destructive: check whether it has produced output or is still running before deciding; do not stop or respawn it on this notice alone.`
+  const minutes = Number.isFinite(a.minutesSilent) ? Math.max(0, Math.trunc(a.minutesSilent)) : 0
+  return `${STALL_PREFIX}${hhmm(sentAt)} local time, ignore if you have since run /bunwarm off or the subagent already finished. A subagent of type ${safeType(a.type)} with id ${safeId(a.id)} had shown running but silent for ${minutes} minutes at that time. Look it up by that id in your own Agent list. Suggested, non-destructive: check whether it has produced output or is still running before deciding; do not stop or respawn it on this notice alone.`
 }
 
 /**
@@ -458,7 +478,7 @@ export async function stallCheck($: EngineInterface) {
       if (known.minutesSilent !== minutes) { known.minutesSilent = minutes; changed = true }
       continue
     }
-    const entry: StalledAgent = { id, description: info.description, type: info.type, minutesSilent: minutes, firstFlaggedAt: now, messageSent: null }
+    const entry: StalledAgent = { id, description: safeDescription(info.description), type: safeType(info.type), minutesSilent: minutes, firstFlaggedAt: now, messageSent: null }
     s.stalled.push(entry)
     changed = true
   }
@@ -470,6 +490,8 @@ export async function stallCheck($: EngineInterface) {
     if (!s.armed || token !== epoch_) break
     changed = true
     try {
+      // Last look before the submit, with no await between this check and the call. A queued prompt cannot be withdrawn (accepted residual, README).
+      if (!s.armed || token !== epoch_ || mainTurns.size !== 0) { changed = false; break }
       const text = stallMessage(f, now)
       stallMessages.set(text, token)
       const r = await Promise.race([
@@ -559,7 +581,9 @@ async function readPulse($: EngineInterface, now: number): Promise<PulseReading>
       // The id is used only as a lookup key against ids the engine gave us; it is never shown.
       if (typeof x.id !== 'string' || typeof x.idleSeconds !== 'number' || !Number.isFinite(x.idleSeconds) || x.idleSeconds < 0) continue
       // A pulse id seen twice cannot be told apart: null marks it ambiguous.
-      agents.set(x.id, agents.has(x.id) ? null : { idleMs: x.idleSeconds * 1000, working: x.toolInFlight === true })
+      // A reading the script flags as growing during the read, or as uncertain, is taken as written just now: never silent.
+      const recent = x.grewDuringRead === true || x.uncertain === true
+      agents.set(x.id, agents.has(x.id) ? null : { idleMs: recent ? 0 : x.idleSeconds * 1000, working: x.toolInFlight === true })
     }
     return { available: true, agents }
   } catch {
@@ -731,7 +755,9 @@ export const register: Register = (on, options) => {
     const optInterval = bounded('userConfig intervalMin', options.intervalMin, ...RANGE.interval, warnings) ?? 50
     const optWindowMin = bounded('userConfig windowMin', options.windowMin, ...RANGE.window, warnings) ?? DEFAULT_WINDOW_MIN
     const optMinTokens = bounded('userConfig minTokens', options.minTokens, ...RANGE.minTokens, warnings) ?? DEFAULT_MIN_TOKENS
-    s.intervalMs = Math.min(envInterval ?? optInterval, MAX_INTERVAL_MIN) * MIN
+    const wantedInterval = envInterval ?? optInterval
+    if (wantedInterval > MAX_INTERVAL_MIN) warnings.push(`ping interval capped at ${MAX_INTERVAL_MIN} minutes: a longer interval would let the cache go cold`)
+    s.intervalMs = Math.min(wantedInterval, MAX_INTERVAL_MIN) * MIN
     // Precedence: env WINDOW_HOURS (the old name, an override when set), then env WINDOW_MIN, then the userConfig windowMin, then 90.
     s.windowMs = envWindowHours !== null ? envWindowHours * HOUR : (envWindowMin ?? optWindowMin) * MIN
     s.minTokens = envMinTokens ?? optMinTokens
