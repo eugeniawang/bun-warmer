@@ -33,19 +33,28 @@ def parse_ts(s):
 
 
 def read_tail(path):
-    """Return (lines, size, mtime). Drops a partial first line (when seeked) and a partial last line."""
+    """Return (lines, size, mtime, grew). Drops a partial first line (when seeked) and a partial last line.
+
+    A file being appended to can grow between fstat() and read(). After the read it is stat'ed again; if size or mtime moved,
+    the newer values are returned and grew is True, so a writer in the middle of appending is never reported by its old mtime.
+    """
     with open(path, "rb") as f:
         st = os.fstat(f.fileno())
         size = st.st_size
         start = max(0, size - TAIL_BYTES)
         f.seek(start)
         data = f.read(TAIL_BYTES)
+        st2 = os.fstat(f.fileno())
+    grew = (st2.st_size, st2.st_mtime) != (st.st_size, st.st_mtime)
+    if grew:
+        st = st2
+        size = max(size, st2.st_size)
     lines = data.split(b"\n")
     # The last element is either "" (file ends with newline) or an incomplete line: drop it either way.
     lines = lines[:-1]
     if start > 0 and lines:
         lines = lines[1:]  # first line may have been cut by the seek
-    return lines, size, st.st_mtime
+    return lines, size, st.st_mtime, grew
 
 
 def classify(d):
@@ -115,7 +124,7 @@ def analyze_tail(lines, mtime, loop_n, empty_ok=True):
 
 def file_info(path, now, loop_n, prev_size, have_prev):
     try:
-        lines, size, mtime = read_tail(path)
+        lines, size, mtime, grew = read_tail(path)
     except OSError as e:
         return {"path": path, "error": "unreadable: %s" % type(e).__name__}
     a = analyze_tail(lines, mtime, loop_n, empty_ok=(size == 0))
@@ -123,7 +132,8 @@ def file_info(path, now, loop_n, prev_size, have_prev):
         "path": path,
         "mtime": mtime,
         "size": size,
-        "idleSeconds": round(now - mtime, 3),
+        "idleSeconds": max(0.0, round(now - mtime, 3)),
+        "grewDuringRead": grew,
         "lastLineKind": a["lastLineKind"],
         "lastConversationKind": a["lastConversationKind"],
         "toolInFlight": bool(a["open"]),

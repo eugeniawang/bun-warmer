@@ -82,7 +82,7 @@ describe('stall watchdog', () => {
     w.setAgents([sub()])
     await clock.advance(60 * MIN)
     expect(w.sent.length).toBe(1)
-    expect(w.sent[0].text).toMatch(/^Bun Warmer: subagent build thing \(a1\) has shown running but silent for \d+ minutes\. Decide: wait, stop it, or respawn it\.$/)
+    expect(w.sent[0].text).toMatch(/^Bun Warmer notice sent at \d\d:\d\d local time, ignore if you have since run \/bunwarm off or the subagent already finished\. Subagent build thing \(a1\) had shown running but silent for \d+ minutes at that time\. Suggested, non-destructive: .*do not stop or respawn it on this notice alone\.$/)
     expect(w.sent[0].origin.kind).toBe('plugin')
     expect(w.state().stalledAgents[0].messageSent).toBe(true)
   })
@@ -223,7 +223,7 @@ describe('stall watchdog', () => {
     const w = world(on)
     await $.session.start(start)
     await $.command.run({ command: 'bunwarm', args: 'off', origin: { kind: 'composer' } } as never)
-    const r = await $.prompt.submit({ text: 'Bun Warmer: subagent x (a1) has shown running but silent for 20 minutes. Decide: wait, stop it, or respawn it.', wait: false, origin: { kind: 'plugin', name: 'bun-warmer' } } as never)
+    const r = await $.prompt.submit({ text: 'Bun Warmer notice sent at 10:00 local time, ignore if you have since run /bunwarm off or the subagent already finished. Subagent x (a1) had shown running but silent for 20 minutes at that time.', wait: false, origin: { kind: 'plugin', name: 'bun-warmer' } } as never)
     expect(r.drop).toBeDefined()
     expect(w.sent.length).toBe(0)
     void clock

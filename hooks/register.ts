@@ -12,6 +12,10 @@ const PULSE_FALLBACK_PATH = '/path/to/bun-warmer/bin/session-pulse.py'
 const PING_PROMPT = 'Reply with the single word: warm'
 const DEFAULT_ACTIVE_START = 6
 const DEFAULT_ACTIVE_END = 23
+// Allowed range of each numeric setting; a value outside it is ignored with a recorded warning.
+const RANGE = {
+  window: [1, 720], interval: [5, 240], maxHours: [1, 48], minTokens: [0, 2_000_000], stall: [1, 720], stallCheck: [1, 60],
+} as const
 
 /** Prompt origins that are a person typing. Everything else (subagent returns, task notifications, peers, schedules, plugins, the SDK) is never blocked. */
 const HUMAN_ORIGINS = ['composer', 'bridge']
@@ -57,6 +61,8 @@ type State = {
   /** Pings not sent because the context was below minTokens or its size was not yet known. */
   skippedSmall: number
   pulse: PulseRecord | null
+  /** Settings that were out of range or not usable at session start, each with the default that replaced it. Our own words plus the variable name, never a raw value. */
+  warnings: string[]
 }
 
 /** ISO 8601 in the machine's local zone with its offset, e.g. 2026-10-14T22:39:00-07:00; with `withMs`, 2026-10-14T22:39:00.123-07:00. Null for an unset time. */
@@ -96,6 +102,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     minTokens: s.minTokens,
     contextTokens: s.ctx || null,
     skippedSmall: s.skippedSmall,
+    configWarnings: s.warnings,
     pulse: s.pulse && { available: s.pulse.available, reason: s.pulse.reason, checkedAt: isoLocal(s.pulse.checkedAt), checkedAtEpoch: epoch(s.pulse.checkedAt), agentsSeen: s.pulse.agentsSeen },
     maxHours: s.maxMs / HOUR,
     note: s.note,
@@ -160,10 +167,16 @@ function hhmm(ms: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function positive(text: string | undefined): number | null {
-  if (text === undefined) return null
-  const n = Number(text)
-  return Number.isFinite(n) && n > 0 ? n : null
+/**
+ * A numeric setting inside [min, max]. Unset (undefined) is null and silent. Anything else that is not a finite number in range
+ * (empty, text, NaN, Infinity, 1e300, zero, negative) is null too, and a warning naming the variable is pushed so the state file shows it.
+ */
+export function bounded(name: string, value: unknown, min: number, max: number, warnings: string[]): number | null {
+  if (value === undefined) return null
+  const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
+  if (Number.isFinite(n) && n >= min && n <= max) return n
+  warnings.push(`${name} ignored: not a number from ${min} to ${max}, so the default applies`)
+  return null
 }
 
 export function freshState(): State {
@@ -171,7 +184,7 @@ export function freshState(): State {
     sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
     lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
-    quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null,
+    quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
   }
 }
 
@@ -209,6 +222,8 @@ let errorFileWritten = false
 let durabilityNote: string | null = null
 /** Tool calls started and not finished, per agent id ('' is the main conversation). A subagent with one in flight is working, not silent. */
 const inFlight = new Map<string, number>()
+/** Turn ids of main-loop turns started and not yet completed, from turn.start / turn.step / turn.complete. The API has no call that says whether the main loop is busy, so this is our own count of the events. */
+const mainTurns = new Set<string>()
 
 /** Forget everything about the session that was running, keep the configuration. Used on session.end and on a changed session id. */
 function resetSession() {
@@ -219,8 +234,9 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings })
   lastEventAt.clear()
+  mainTurns.clear()
   errorFileWritten = false
   inFlight.clear()
   durabilityNote = null
@@ -379,8 +395,10 @@ function touchAgent(id: string | undefined, now: number) {
   lastEventAt.set(id, now)
 }
 
-function stallMessage(a: StalledAgent): string {
-  return `Bun Warmer: subagent ${a.description} (${a.id}) has shown running but silent for ${a.minutesSilent} minutes. Decide: wait, stop it, or respawn it.`
+/** Starts with a notice that is harmless if it arrives late: it names the time, says when to ignore it, and suggests nothing destructive. */
+export const STALL_PREFIX = 'Bun Warmer notice sent at '
+function stallMessage(a: StalledAgent, sentAt: number): string {
+  return `${STALL_PREFIX}${hhmm(sentAt)} local time, ignore if you have since run /bunwarm off or the subagent already finished. Subagent ${a.description} (${a.id}) had shown running but silent for ${a.minutesSilent} minutes at that time. Suggested, non-destructive: check whether it has produced output or is still running before deciding; do not stop or respawn it on this notice alone.`
 }
 
 /**
@@ -401,6 +419,7 @@ export async function stallCheck($: EngineInterface) {
   const now = await $.clock.now()
   if (token !== epoch_) return
   const running = new Map<string, { description: string; type: string }>()
+  const listedIds = new Set<string>(list.filter(a => a && typeof a.id === 'string').map(a => a.id))
   for (const a of list) {
     if (!a || !a.id || a.status !== 'running') continue
     running.set(a.id, { description: a.description, type: a.type })
@@ -421,7 +440,7 @@ export async function stallCheck($: EngineInterface) {
   /** Silence in ms for an agent: the event-based figure, lowered to the pulse's figure when the pulse knows the agent. Both must exceed the threshold for a flag. */
   const silenceOf = (id: string): number => {
     const byEvents = now - (lastEventAt.get(id) ?? now)
-    const p = pulse?.available === true ? pulse.agents.get(normAgentId(id)) : undefined
+    const p = pulse?.available === true ? pulseFor(pulse.agents, id, listedIds) : undefined
     if (!p) return byEvents // pulse unavailable or silent about this agent: the event signal alone
     return Math.min(byEvents, p.working ? 0 : p.idleMs)
   }
@@ -430,7 +449,6 @@ export async function stallCheck($: EngineInterface) {
     if (!keep) changed = true
     return keep
   })
-  const fresh: StalledAgent[] = []
   for (const [id, info] of running) {
     const silent = silenceOf(id)
     if (silent < s.stallMs) continue
@@ -442,14 +460,17 @@ export async function stallCheck($: EngineInterface) {
     }
     const entry: StalledAgent = { id, description: info.description, type: info.type, minutesSilent: minutes, firstFlaggedAt: now, messageSent: null }
     s.stalled.push(entry)
-    fresh.push(entry)
     changed = true
   }
-  for (const f of fresh) {
+  // $.prompt.submit queues behind a busy main loop, and the API has no way to withdraw a queued prompt. So a message goes out only
+  // while no main-loop turn is running; a flagged agent waits (messageSent null) and is sent on a later pass once the loop is idle.
+  const due = mainTurns.size === 0 ? s.stalled.filter(f => f.messageSent === null) : []
+  for (const f of due) {
     // Disarmed, or the session changed under us while an earlier message was pending: send nothing more.
     if (!s.armed || token !== epoch_) break
+    changed = true
     try {
-      const text = stallMessage(f)
+      const text = stallMessage(f, now)
       stallMessages.set(text, token)
       const r = await Promise.race([
         $.prompt.submit({ text }),
@@ -469,17 +490,34 @@ export async function stallCheck($: EngineInterface) {
 }
 
 type PulseAgent = { idleMs: number; working: boolean }
-type PulseReading = { available: true; agents: Map<string, PulseAgent> } | { available: false; reason: string }
+type PulseReading = { available: true; agents: Map<string, PulseAgent | null> } | { available: false; reason: string }
 
-/** The pulse names agents `<id>`; the engine may or may not carry an `agent-` prefix. Compare without it. */
-function normAgentId(id: string): string {
-  return id.startsWith('agent-') ? id.slice('agent-'.length) : id
+/**
+ * The pulse's reading for a listed agent id, matched exactly: the listed id as it is, or the pulse's `agent-<id>` file form.
+ * One direction only (never strip a prefix from the listed id), so `a1` and `agent-a1` stay two agents. The form `agent-<id>` is skipped
+ * when another listed agent carries exactly that id. Two pulse entries that could be this agent, or a duplicated id in the pulse, are ambiguous: undefined.
+ */
+function pulseFor(agents: Map<string, PulseAgent | null>, id: string, listed: ReadonlySet<string>): PulseAgent | undefined {
+  const keys = [id]
+  const prefixed = `agent-${id}`
+  if (!listed.has(prefixed)) keys.push(prefixed)
+  const hits = keys.filter(k => agents.has(k))
+  if (hits.length !== 1) return undefined
+  return agents.get(hits[0]) ?? undefined
 }
 
 /** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`), the fixed Developer path. `test -f` through argv, no shell. */
 async function pulsePath($: EngineInterface): Promise<string | null> {
   const candidates: string[] = []
-  try { const env = (await $.env.get('BUN_WARMER_PULSE'))?.trim(); if (env) candidates.push(env) } catch { /* next */ }
+  try {
+    const env = (await $.env.get('BUN_WARMER_PULSE'))?.trim()
+    // A relative path would resolve against the session's project directory, which can hold anyone's file: absolute `.py` only.
+    if (env && env.startsWith('/') && env.endsWith('.py')) candidates.push(env)
+    else if (env) {
+      const note = 'BUN_WARMER_PULSE ignored: it must be an absolute path (starting with /) to a .py file, so the next candidate is used'
+      if (!s.warnings.includes(note)) s.warnings.push(note)
+    }
+  } catch { /* next */ }
   try { const root = $.plugin.root; if (root) candidates.push(`${root}/bin/session-pulse.py`) } catch { /* next */ }
   candidates.push(PULSE_FALLBACK_PATH)
   for (const c of candidates) {
@@ -514,13 +552,14 @@ async function readPulse($: EngineInterface, now: number): Promise<PulseReading>
     const o = j as Record<string, unknown>
     if (o.available !== true) return { available: false, reason: 'pulse-reported-unavailable' }
     if (!Array.isArray(o.agents)) return { available: false, reason: 'unparseable' }
-    const agents = new Map<string, PulseAgent>()
+    const agents = new Map<string, PulseAgent | null>()
     for (const a of o.agents) {
       if (!a || typeof a !== 'object') continue
       const x = a as Record<string, unknown>
       // The id is used only as a lookup key against ids the engine gave us; it is never shown.
       if (typeof x.id !== 'string' || typeof x.idleSeconds !== 'number' || !Number.isFinite(x.idleSeconds) || x.idleSeconds < 0) continue
-      agents.set(normAgentId(x.id), { idleMs: x.idleSeconds * 1000, working: x.toolInFlight === true })
+      // A pulse id seen twice cannot be told apart: null marks it ambiguous.
+      agents.set(x.id, agents.has(x.id) ? null : { idleMs: x.idleSeconds * 1000, working: x.toolInFlight === true })
     }
     return { available: true, agents }
   } catch {
@@ -673,23 +712,39 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     resetSession()
     s.sid = await $.session.id()
-    const envInterval = positive(await $.env.get('BUN_WARMER_INTERVAL_MIN'))
-    const envWindowHours = positive(await $.env.get('BUN_WARMER_WINDOW_HOURS'))
-    const envWindowMin = positive(await $.env.get('BUN_WARMER_WINDOW_MIN'))
-    const envMinTokens = positive(await $.env.get('BUN_WARMER_MIN_TOKENS'))
-    const optInterval = typeof options.intervalMin === 'number' && options.intervalMin > 0 ? options.intervalMin : 50
-    const optWindowMin = typeof options.windowMin === 'number' && options.windowMin > 0 ? options.windowMin : DEFAULT_WINDOW_MIN
-    const optMinTokens = typeof options.minTokens === 'number' && options.minTokens > 0 ? options.minTokens : DEFAULT_MIN_TOKENS
+    const warnings: string[] = []
+    s.warnings = warnings
+    const rawEnv: Record<string, string | undefined> = {
+      BUN_WARMER_INTERVAL_MIN: await $.env.get('BUN_WARMER_INTERVAL_MIN'),
+      BUN_WARMER_WINDOW_HOURS: await $.env.get('BUN_WARMER_WINDOW_HOURS'),
+      BUN_WARMER_WINDOW_MIN: await $.env.get('BUN_WARMER_WINDOW_MIN'),
+      BUN_WARMER_MIN_TOKENS: await $.env.get('BUN_WARMER_MIN_TOKENS'),
+      BUN_WARMER_MAX_HOURS: await $.env.get('BUN_WARMER_MAX_HOURS'),
+      BUN_WARMER_STALL_MIN: await $.env.get('BUN_WARMER_STALL_MIN'),
+      BUN_WARMER_STALL_CHECK_MIN: await $.env.get('BUN_WARMER_STALL_CHECK_MIN'),
+    }
+    const num = (name: string, min: number, max: number) => bounded(name, rawEnv[name], min, max, warnings)
+    const envInterval = num('BUN_WARMER_INTERVAL_MIN', ...RANGE.interval)
+    const envWindowHours = num('BUN_WARMER_WINDOW_HOURS', RANGE.window[0] / 60, RANGE.window[1] / 60)
+    const envWindowMin = num('BUN_WARMER_WINDOW_MIN', ...RANGE.window)
+    const envMinTokens = num('BUN_WARMER_MIN_TOKENS', ...RANGE.minTokens)
+    const optInterval = bounded('userConfig intervalMin', options.intervalMin, ...RANGE.interval, warnings) ?? 50
+    const optWindowMin = bounded('userConfig windowMin', options.windowMin, ...RANGE.window, warnings) ?? DEFAULT_WINDOW_MIN
+    const optMinTokens = bounded('userConfig minTokens', options.minTokens, ...RANGE.minTokens, warnings) ?? DEFAULT_MIN_TOKENS
     s.intervalMs = Math.min(envInterval ?? optInterval, MAX_INTERVAL_MIN) * MIN
     // Precedence: env WINDOW_HOURS (the old name, an override when set), then env WINDOW_MIN, then the userConfig windowMin, then 90.
     s.windowMs = envWindowHours !== null ? envWindowHours * HOUR : (envWindowMin ?? optWindowMin) * MIN
     s.minTokens = envMinTokens ?? optMinTokens
-    s.maxMs = (positive(await $.env.get('BUN_WARMER_MAX_HOURS')) ?? DEFAULT_MAX_HOURS) * HOUR
-    s.stallMs = (positive(await $.env.get('BUN_WARMER_STALL_MIN')) ?? 20) * MIN
-    s.stallCheckMs = (positive(await $.env.get('BUN_WARMER_STALL_CHECK_MIN')) ?? 5) * MIN
+    s.maxMs = (num('BUN_WARMER_MAX_HOURS', ...RANGE.maxHours) ?? DEFAULT_MAX_HOURS) * HOUR
+    s.stallMs = (num('BUN_WARMER_STALL_MIN', ...RANGE.stall) ?? 20) * MIN
+    s.stallCheckMs = (num('BUN_WARMER_STALL_CHECK_MIN', ...RANGE.stallCheck) ?? 5) * MIN
     s.quietEnabled = !quietHoursOff(await $.env.get('BUN_WARMER_QUIET_HOURS'))
-    s.activeStart = hourSetting(await $.env.get('BUN_WARMER_ACTIVE_START'), DEFAULT_ACTIVE_START)
-    s.activeEnd = hourSetting(await $.env.get('BUN_WARMER_ACTIVE_END'), DEFAULT_ACTIVE_END)
+    const rawStart = await $.env.get('BUN_WARMER_ACTIVE_START')
+    const rawEnd = await $.env.get('BUN_WARMER_ACTIVE_END')
+    s.activeStart = hourSetting(rawStart, DEFAULT_ACTIVE_START)
+    s.activeEnd = hourSetting(rawEnd, DEFAULT_ACTIVE_END)
+    if (rawStart !== undefined && hourSetting(rawStart, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_START ignored: not a whole hour from 0 to 23, so the default applies')
+    if (rawEnd !== undefined && hourSetting(rawEnd, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_END ignored: not a whole hour from 0 to 23, so the default applies')
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
@@ -732,7 +787,7 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     await ensureSession($)
     const isHuman = HUMAN_ORIGINS.includes(e.origin.kind)
-    if (e.origin.kind === 'plugin' && e.origin.name === PLUGIN_NAME && e.text.startsWith('Bun Warmer: subagent')) {
+    if (e.origin.kind === 'plugin' && e.origin.name === PLUGIN_NAME && e.text.startsWith(STALL_PREFIX)) {
       // Our own stall message: drop it if the mod was turned off or the session changed since it was prepared.
       const prepared = stallMessages.get(e.text)
       if (!s.armed || prepared === undefined || prepared !== epoch_) return { drop: 'bun-warmer is off or the session changed' }
@@ -759,8 +814,15 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('turn.start', async ($, e, next) => {
+    const r = await next(e)
+    if (!e.agentId) mainTurns.add(e.turnId)
+    return r
+  })
+
   on('turn.step', async function* ($, e, next) {
     await ensureSession($)
+    if (!e.agentId) mainTurns.add(e.turnId) // a reload mid-turn missed the start
     // Any loop counts, subagents included: an orchestrator waiting on them is busy, not idle.
     touchAgent(e.agentId, await $.clock.now())
     await activity($, false, e.agentId)
@@ -768,6 +830,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) mainTurns.delete(e.turnId)
     const r = await next(e)
     await ensureSession($)
     touchAgent(e.agentId, await $.clock.now())
