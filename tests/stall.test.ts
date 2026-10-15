@@ -8,7 +8,7 @@ const START = 1_800_000_000_000
 
 type Agent = { id: string; description: string; type: string; status: string }
 
-function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' | 'throw' = 'ok') {
+function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' | 'throw' | 'hold' = 'ok') {
   const files = new Map<string, string>()
   const finals = new Map<string, string>()
   const status: Array<string | undefined> = []
@@ -22,23 +22,28 @@ function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' |
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'S1' }))
+  let sid = 'S1'
+  on('session.id', () => ({ value: sid }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 1000 }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: agents as never }))
   on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
-  on('ui.log', () => ({ value: undefined }))
+  const logs: string[] = []
+  on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never })
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  on('prompt.submit', ($, e) => {
+  let gate: () => void = () => {}
+  const held = new Promise<void>(res => { gate = res })
+  on('prompt.submit', async ($, e) => {
+    if (submit === 'hold') await held
     sent.push({ text: e.text, origin: e.origin })
     if (submit === 'throw') throw new Error('no route')
     if (submit === 'drop') return { drop: 'refused' }
     return { text: e.text }
   })
   return {
-    sent, status,
+    sent, status, logs, setSid: (id: string) => { sid = id }, release: () => gate(),
     state: () => JSON.parse(finals.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any>,
     setAgents: (a: Agent[]) => { agents = a },
   }
@@ -195,5 +200,31 @@ describe('stall watchdog', () => {
     expect(w.state().stallMin).toBe(1)
     expect(w.state().stallCheckMin).toBe(1)
     expect(w.sent.length).toBe(1)
+  })
+  test('/clear while a message is pending: the next stall of the old session is not sent into the new one', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, {}, 'hold')
+    await $.session.start(start)
+    w.setAgents([sub(), { ...sub(), id: 'a2', description: 'second thing' }])
+    await clock.advance(25 * MIN) // both flagged; message 1 is stuck in the 15 s race
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } } as never)
+    w.setSid('S2')
+    const fresh = $.prompt.submit({ text: 'fresh', wait: false, origin: { kind: 'composer' } } as never) // a new session arms again
+    await clock.advance(1000)
+    w.release()
+    await fresh
+    await clock.advance(1 * MIN) // the 15 s race ends; the old loop must stop, not message about a2
+    expect(w.sent.filter(m => /second thing/.test(m.text)).length).toBe(0)
+  })
+
+  test('our own stall message is dropped at prompt.submit when the mod is off', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on)
+    await $.session.start(start)
+    await $.command.run({ command: 'bunwarm', args: 'off', origin: { kind: 'composer' } } as never)
+    const r = await $.prompt.submit({ text: 'Bun Warmer: subagent x (a1) has shown running but silent for 20 minutes. Decide: wait, stop it, or respawn it.', wait: false, origin: { kind: 'plugin', name: 'bun-warmer' } } as never)
+    expect(r.drop).toBeDefined()
+    expect(w.sent.length).toBe(0)
+    void clock
   })
 })
