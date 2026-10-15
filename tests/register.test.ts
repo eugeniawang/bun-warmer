@@ -19,11 +19,11 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   const status: Array<string | undefined> = []
   const logs: string[] = []
   const prompts: string[] = []
-  let agents: Array<{ status: string }> = []
+  let agents: Array<{ status: string; id?: string }> = []
   let forkHook: (() => Promise<void>) | null = null
   let sid = 'S1'
   let ctxTokens = 200000
-  const fail = { mv: false, write: false, errWrite: false, rmFinal: false }
+  const fail = { mv: false, write: false, errWrite: false, rmFinal: false, rmErr: false }
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
   on('fs.write', ($, e) => {
     if (fail.write && e.path.endsWith('.tmp')) throw new Error('disk full')
@@ -39,6 +39,7 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
     }
     if (cmd === 'rm') {
       if (fail.rmFinal && from.endsWith('.json') && !from.endsWith('.error.json')) return done(1, 'Operation not permitted')
+      if (fail.rmErr && from.endsWith('.error.json')) return done(1, 'Operation not permitted')
       files.delete(from); finals.delete(from)
     }
     return done(0)
@@ -71,7 +72,7 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
     onFork: (f: () => Promise<void>) => { forkHook = f },
     setSid: (id: string) => { sid = id },
     setCtx: (n: number) => { ctxTokens = n },
-    setAgents: (a: Array<{ status: string }>) => { agents = a },
+    setAgents: (a: Array<{ status: string; id?: string }>) => { agents = a },
   }
 }
 
@@ -443,5 +444,75 @@ describe('bun-warmer', () => {
     await clock.advance(2 * HOUR + 30 * MIN)
     expect((await $.prompt.submit(say('/compact', composer))).drop).toBe(undefined)
     expect(w.state().guardDrops).toBe(0)
+  })
+  test('a subagent that completes during a ping moves lastActivityAt; the ping\'s own events still do not', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    const before = w.state().lastActivityAtEpoch
+    w.setAgents([{ status: 'running', id: 'sub1' }])
+    w.onFork(async () => {
+      for await (const _ of $.turn.step(step())) { /* the ping's own, no agentId */ }
+      await $.turn.complete(answer())
+      await $.turn.complete(answer({ agentId: 'sub1' } as never)) // real subagent work, mid-ping
+    })
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.state().lastActivityAtEpoch).toBeGreaterThan(before)
+    expect(w.state().lastActivityAtEpoch).toBeGreaterThanOrEqual(w.state().lastPingAtEpoch)
+  })
+
+  test('a fork whose events carry an agentId no list names does not count as activity', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    const before = w.state().lastActivityAtEpoch
+    w.onFork(async () => { await $.turn.complete(answer({ agentId: 'engine-fork-1' } as never)) })
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.state().lastActivityAtEpoch).toBe(before)
+  })
+
+  test('/clear during a slow ping: the old answer is discarded and the new session pings on schedule', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    let release: () => void = () => {}
+    w.onFork(() => new Promise<void>(res => { release = res }))
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(1) // ping 1 is out, unresolved
+    w.onFork(async () => {})
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } } as never)
+    w.setSid('S2')
+    expect((await $.prompt.submit(say('fresh', composer))).drop).toBe(undefined)
+    release()
+    await clock.advance(1000)
+    expect(w.state('S2').lastPing).toBe(null)
+    expect(w.state('S2').refusals).toBe(0)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.state('S2').lastPing.ok).toBe(true)
+  })
+
+  test('a failed removal of the error file keeps the flag and the next write retries', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    w.fail.mv = true
+    await $.turn.complete(answer())
+    expect([...w.files.keys()].some(k => k.endsWith('.error.json'))).toBe(true)
+    w.fail.mv = false
+    w.fail.rmErr = true
+    await $.turn.complete(answer())
+    expect([...w.files.keys()].some(k => k.endsWith('.error.json'))).toBe(true) // the delete failed: still there
+    expect(w.logs.some(l => /could not remove the old error file/.test(l))).toBe(true)
+    w.fail.rmErr = false
+    await $.turn.complete(answer())
+    expect([...w.files.keys()].some(k => k.endsWith('.error.json'))).toBe(false) // retried and gone
+    void clock
   })
 })

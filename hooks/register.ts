@@ -123,6 +123,13 @@ let stallTimer: { cancel: () => void } | null = null
 /** Last event seen per subagent id (turn.step, turn.complete, tool.call carrying that agentId). Not persisted. */
 const lastEventAt = new Map<string, number>()
 let pinging = false
+/** Bumped by resetSession: a ping, tick or watchdog pass that began under an older value belongs to a session that is gone and must not write into the new one. */
+let generation = 0
+/** Bumped by resetSession and by every disarm: a stall message prepared under an older value must not be sent. */
+let epoch_ = 0
+/** Stall messages this plugin has submitted, mapped to the epoch they were prepared in. The prompt.submit hook drops one whose epoch is no longer current. */
+const stallMessages = new Map<string, number>()
+const PLUGIN_NAME = 'bun-warmer'
 let writes: Promise<void> = Promise.resolve()
 /** True while an `<id>.error.json` from a failed write sits beside the state file. */
 let errorFileWritten = false
@@ -135,6 +142,10 @@ const inFlight = new Map<string, number>()
 function resetSession() {
   cancel()
   stopStall()
+  generation++
+  epoch_++
+  stallMessages.clear()
+  pinging = false
   const c = freshState()
   Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs })
   lastEventAt.clear()
@@ -203,8 +214,11 @@ function persist($: EngineInterface) {
       } else {
         if (durabilityNote) { durabilityNote = null; status($, now) }
         if (errorFileWritten) {
-          await $.process.run(['rm', '-f', errPath])
-          errorFileWritten = false
+          // The flag clears only when the file is really gone; otherwise the next write retries the removal.
+          let gone = false
+          try { gone = (await $.process.run(['rm', '-f', errPath])).exitCode === 0 } catch { /* retried on the next write */ }
+          if (gone) errorFileWritten = false
+          else $.ui.log('bun-warmer: could not remove the old error file; will retry on the next write')
         }
       }
     } catch (err) {
@@ -242,12 +256,14 @@ function schedule($: EngineInterface, now: number) {
   // A cold cache is not pinged: that would pay the full rewrite. Only expiry is watched until activity returns.
   const pingAt = base && now < coldAt ? base + s.intervalMs : s.expiresAt
   const due = Math.min(pingAt, s.expiresAt)
-  timer = $.clock.after(Math.max(1000, due - now), () => { void tick($) })
+  timer = $.clock.after(Math.max(1000, due - now), () => { tick($).catch(err => safeLog($, `tick failed (${errText(err)})`)) })
 }
 
 async function disarm($: EngineInterface, why: string) {
   cancel()
   stopStall()
+  epoch_++
+  stallMessages.clear()
   s.armed = false
   s.stalled = []
   s.note = why
@@ -298,6 +314,7 @@ function stallMessage(a: StalledAgent): string {
  */
 export async function stallCheck($: EngineInterface) {
   if (!s.armed) return
+  const token = epoch_
   let list
   try {
     list = await $.agent.list()
@@ -305,6 +322,7 @@ export async function stallCheck($: EngineInterface) {
     return
   }
   const now = await $.clock.now()
+  if (token !== epoch_) return
   const running = new Map<string, { description: string; type: string }>()
   for (const a of list) {
     if (!a || !a.id || a.status !== 'running') continue
@@ -336,10 +354,13 @@ export async function stallCheck($: EngineInterface) {
     changed = true
   }
   for (const f of fresh) {
-    if (!s.armed) break
+    // Disarmed, or the session changed under us while an earlier message was pending: send nothing more.
+    if (!s.armed || token !== epoch_) break
     try {
+      const text = stallMessage(f)
+      stallMessages.set(text, token)
       const r = await Promise.race([
-        $.prompt.submit({ text: stallMessage(f) }),
+        $.prompt.submit({ text }),
         // submit resolves when the prompt enters or is queued; do not hold the watchdog on a busy loop forever.
         new Promise<'pending'>(res => { $.clock.after(15000, () => res('pending')) }),
       ])
@@ -349,15 +370,28 @@ export async function stallCheck($: EngineInterface) {
       $.ui.log(`bun-warmer: could not message the orchestrator about a stalled subagent (${err instanceof Error ? err.message : String(err)})`)
     }
   }
-  if (changed) {
+  if (changed && token === epoch_) {
     status($, now)
     await persist($)
   }
 }
 
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/** Log without ever throwing or rejecting. */
+async function safeLog($: EngineInterface, text: string) {
+  try { await $.ui.log(`bun-warmer: ${text}`) } catch { /* nowhere left to report */ }
+}
+
 function scheduleStall($: EngineInterface) {
   if (stallTimer) stallTimer.cancel()
-  stallTimer = $.clock.after(s.stallCheckMs, () => { void stallCheck($).finally(() => { if (stallTimer) scheduleStall($) }) })
+  stallTimer = $.clock.after(s.stallCheckMs, () => {
+    stallCheck($)
+      .catch(err => safeLog($, `stall check failed (${errText(err)})`))
+      .finally(() => { if (stallTimer) scheduleStall($) })
+  })
 }
 
 function stopStall() {
@@ -368,13 +402,20 @@ function stopStall() {
 async function tick($: EngineInterface) {
   timer = null
   if (!s.armed) return
+  const gen = generation
   const now = await $.clock.now()
+  if (gen !== generation) return
   if (now >= s.expiresAt) {
     // Subagents working or turns still arriving mean the session is busy, not finished.
     const capAt = s.windowStartAt + s.maxMs
     if (now >= capAt) return disarm($, `maximum of ${fmtDur(s.maxMs)} reached`)
     if (now - s.lastActivityAt < s.intervalMs || await hasActiveAgents($)) return arm($, now, true)
     return disarm($, 'window expired')
+  }
+  if (pinging) {
+    // A ping is still out (slow API): look again later rather than lose the schedule.
+    schedule($, now)
+    return
   }
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
   if (!base || now - base >= COLD_AFTER_MS || now - base < s.intervalMs - 1000) {
@@ -387,6 +428,7 @@ async function tick($: EngineInterface) {
 async function ping($: EngineInterface, now: number) {
   if (pinging) return
   pinging = true
+  const gen = generation
   let result: PingResult
   try {
     let reply
@@ -412,8 +454,11 @@ async function ping($: EngineInterface, now: number) {
         : { at: now, ok: false, reason: `the cache was already gone (read ${u.cache_read_input_tokens}, wrote ${u.cache_creation_input_tokens} tokens)`, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens }
     }
   } finally {
-    pinging = false
+    // resetSession already cleared the flag, and a newer ping may own it now.
+    if (gen === generation) pinging = false
   }
+  // The session was cleared or resumed while the fork was out: its answer belongs to nobody now.
+  if (gen !== generation) return
   s.lastPing = result
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
@@ -423,10 +468,17 @@ async function ping($: EngineInterface, now: number) {
   await persist($)
 }
 
-async function activity($: EngineInterface, human: boolean) {
+/** True for an id that `$.agent.list()` names: a real subagent, as opposed to an engine fork (compaction, memory, the ping) whose id no list names. */
+async function isListedAgent($: EngineInterface, id: string): Promise<boolean> {
+  try { return (await $.agent.list()).some(a => a && a.id === id) } catch { return false }
+}
+
+async function activity($: EngineInterface, human: boolean, agentId?: string) {
   const now = await $.clock.now()
   // The ping's own model call is not the session's activity: lastActivityAt tells a reader when work last happened.
-  if (pinging && !human) return
+  // The API stamps no marker on a fork's events, so inside the ping window an event with no agentId is taken for the ping's;
+  // one carrying the id of a listed subagent is that subagent's own work and counts.
+  if (pinging && !human && !(agentId && await isListedAgent($, agentId))) return
   s.lastActivityAt = now
   if (human) return arm($, now)
   if (s.armed) schedule($, now)
@@ -497,6 +549,11 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     await ensureSession($)
     const isHuman = HUMAN_ORIGINS.includes(e.origin.kind)
+    if (e.origin.kind === 'plugin' && e.origin.name === PLUGIN_NAME && e.text.startsWith('Bun Warmer: subagent')) {
+      // Our own stall message: drop it if the mod was turned off or the session changed since it was prepared.
+      const prepared = stallMessages.get(e.text)
+      if (!s.armed || prepared === undefined || prepared !== epoch_) return { drop: 'bun-warmer is off or the session changed' }
+    }
     if (!isHuman) {
       // A subagent return, task notification, peer, schedule or plugin message is never held back.
       await activity($, false)
@@ -523,7 +580,7 @@ export const register: Register = (on, options) => {
     await ensureSession($)
     // Any loop counts, subagents included: an orchestrator waiting on them is busy, not idle.
     touchAgent(e.agentId, await $.clock.now())
-    await activity($, false)
+    await activity($, false, e.agentId)
     yield* next(e)
   })
 
@@ -532,7 +589,7 @@ export const register: Register = (on, options) => {
     await ensureSession($)
     touchAgent(e.agentId, await $.clock.now())
     await refreshCtx($)
-    await activity($, false)
+    await activity($, false, e.agentId)
     return r
   })
 
@@ -549,7 +606,7 @@ export const register: Register = (on, options) => {
       // Completion is activity too: the clock restarts when the tool ends, not only when it began.
       try {
         touchAgent(e.agentId, await $.clock.now())
-        await activity($, false)
+        await activity($, false, e.agentId)
       } catch { /* never fail a tool call over bookkeeping */ }
     }
   })
