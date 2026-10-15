@@ -322,12 +322,13 @@ function status($: EngineInterface, now: number) {
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
+  const state = !base ? 'idle' : now - base >= COLD_AFTER_MS ? 'cold' : 'warm'
   const next = !base ? 'waiting for the first turn'
     : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
     : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity'
     : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
     : `ping in ${fmtDur(Math.max(base + s.intervalMs, s.notBefore) - now)}`
-  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
+  return $.ui.status(`bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
 }
 
 function stallText(): string {
