@@ -15,6 +15,16 @@ Requires Claude Code 2.1.300 or newer (function hooks, early-access API).
 - A ping that fails, is refused, or finds the cache already gone is recorded as failed in the state file and shown in the status line. It is never reported as success.
 - The mod does not know model prices, so the guard note shows the token count that would be re-written, not a dollar figure.
 
+## Stall watchdog
+
+While a session has subagents, a second timer (separate from the ping) checks `$.agent.list()` every `BUN_WARMER_STALL_CHECK_MIN` minutes (default 5). The call is local and costs no tokens. A subagent whose status is `running` and that has produced no event (turn step, turn completion, tool call) for `BUN_WARMER_STALL_MIN` minutes (default 20, generous because a long build inside one tool call looks quiet) is stalled. An agent never seen producing an event is timed from the first check that saw it running. The watchdog never stops or kills anything.
+
+Each stall is reported once. The watchdog records it in the state file (`stalledAgents`), adds `STALLED: <description> <N>m` to the status line, and sends one message to the orchestrator: "Bun Warmer: subagent <description> (<id>) has shown running but silent for <N> minutes. Decide: wait, stop it, or respawn it." The flag clears when the agent produces events again or is no longer `running`; a later stall is a new report.
+
+Route for the message: `$.prompt.submit({ text })`. It enters the main conversation as a prompt with origin `{ kind: 'plugin', name: 'bun-warmer' }`, framed to the model as "The bun-warmer plugin sent a message", and it starts a turn of its own once the session is idle. The engine skips the calling plugin's own `prompt.submit` hook for it, so Bun Warmer's guard never sees its own message (and `plugin` is not a human origin anyway). If the engine drops it or the call throws, `messageSent` is `false` in the state file, the stall is still recorded and shown, and nothing else is tried.
+
+Not chosen: `$.session.append` adds a user-role row but starts no turn, so an idle orchestrator would not act on it; `$.session.send` needs a recipient address and the types give no address for the main conversation; `$.session.receive` is the hook for inbound deliveries, not a way to send.
+
 ## Settings
 
 | Setting | Default | Config route |
@@ -22,6 +32,8 @@ Requires Claude Code 2.1.300 or newer (function hooks, early-access API).
 | Ping interval | 50 minutes (capped at 55) | env `BUN_WARMER_INTERVAL_MIN`, else `userConfig` field `intervalMin` |
 | Window | 3 hours | env `BUN_WARMER_WINDOW_HOURS`, else `userConfig` field `windowHours` |
 | Guard | `warn` | `userConfig` field `guard` (`warn` or `refuse`) |
+| Stall threshold | 20 minutes | env `BUN_WARMER_STALL_MIN` |
+| Stall check interval | 5 minutes | env `BUN_WARMER_STALL_CHECK_MIN` |
 
 An environment variable beats the `userConfig` value. `userConfig` fields are rows in the Claude Code config menu; for a folder-loaded plugin they are stored in settings under `pluginConfigs` keyed `bun-warmer@inline`.
 
@@ -44,7 +56,12 @@ Slash command: `/bunwarm` shows status, `/bunwarm off` stops it for this session
   "lastPing": { "at": "…", "atEpoch": 0, "ok": true, "reason": null, "cacheReadTokens": 0, "cacheWriteTokens": 0 },
   "intervalMin": 50,
   "windowHours": 3,
-  "note": null
+  "note": null,
+  "stallMin": 20,
+  "stallCheckMin": 5,
+  "stalledAgents": [
+    { "id": "…", "description": "…", "type": "general-purpose", "minutesSilent": 22, "firstFlaggedAt": "…", "firstFlaggedAtEpoch": 0, "messageSent": true }
+  ]
 }
 ```
 
@@ -77,6 +94,10 @@ To go back: remove the env line and `claude plugin enable cache-tax@claude-code-
 ## Not built
 
 A close-the-session trigger shortly before expiry. The `$.session` API in this build has no close or exit call, so there is nothing to call. The state file carries `expiresAt` for an outside close hook instead.
+
+## Unproven
+
+See the live-test result below once recorded. Not proven by the unit tests: that a real orchestrator reads the message while it is blocked waiting on a subagent. `$.prompt.submit` is documented as a turn of its own "once the session is idle", so while the main loop is mid-turn the message waits until that turn ends. Event coverage for a subagent is turn.step, turn.complete and tool.call; a subagent that streams for a long time inside one model step would look quiet.
 
 ## Development
 
