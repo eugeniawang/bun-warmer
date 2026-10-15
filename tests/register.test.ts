@@ -20,12 +20,14 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   const logs: string[] = []
   const prompts: string[] = []
   let agents: Array<{ status: string }> = []
+  let forkHook: (() => Promise<void>) | null = null
   let sid = 'S1'
   let ctxTokens = 200000
-  const fail = { mv: false, write: false }
+  const fail = { mv: false, write: false, errWrite: false, rmFinal: false }
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
   on('fs.write', ($, e) => {
     if (fail.write && e.path.endsWith('.tmp')) throw new Error('disk full')
+    if (fail.errWrite && e.path.endsWith('.error.json')) throw new Error('disk full')
     files.set(e.path, e.text); return { value: undefined }
   })
   on('process.run', ($, e) => {
@@ -35,7 +37,10 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
       if (fail.mv) return done(1, 'Permission denied')
       finals.set(to, files.get(from) ?? ''); files.delete(from)
     }
-    if (cmd === 'rm') { files.delete(from); files.delete(to); finals.delete(to) }
+    if (cmd === 'rm') {
+      if (fail.rmFinal && from.endsWith('.json') && !from.endsWith('.error.json')) return done(1, 'Operation not permitted')
+      files.delete(from); finals.delete(from)
+    }
     return done(0)
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -51,8 +56,9 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   on('prompt.submit', ($, e) => { prompts.push(e.text); return { text: e.text } })
   on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never })
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  on('model.fork', () => {
+  on('model.fork', async () => {
     forks.push(forks.length)
+    if (forkHook) await forkHook()
     const a = forkAnswers.shift()
     if (a === undefined) return { value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } as unknown as ModelForkResult }
     if ('isAnswered' in a) return { value: a }
@@ -62,6 +68,7 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
     forks, status, logs, prompts,
     state: (id = 'S1') => JSON.parse(finals.get(`/home/t/.claude/bun-warmer/${id}.json`) ?? 'null') as Record<string, any>,
     fail, files, finals,
+    onFork: (f: () => Promise<void>) => { forkHook = f },
     setSid: (id: string) => { sid = id },
     setCtx: (n: number) => { ctxTokens = n },
     setAgents: (a: Array<{ status: string }>) => { agents = a },
@@ -288,6 +295,48 @@ describe('bun-warmer', () => {
     expect(w.state().armed).toBe(false)
   })
 
+  test('pending and waiting agents do not extend the window; running ones do', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm, warm, warm, warm, warm, warm, warm], { BUN_WARMER_INTERVAL_MIN: '50', BUN_WARMER_WINDOW_HOURS: '1' })
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    w.setAgents([{ status: 'pending' }, { status: 'waiting' }])
+    await clock.advance(3 * HOUR)
+    expect(w.state().armed).toBe(false)
+    expect(w.state().note).toBe('window expired')
+  })
+
+  test('a running agent cannot extend the window past BUN_WARMER_MAX_HOURS; the reason is recorded', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { BUN_WARMER_INTERVAL_MIN: '50', BUN_WARMER_WINDOW_HOURS: '1', BUN_WARMER_MAX_HOURS: '3' })
+    await $.session.start(start)
+    w.setAgents([{ status: 'running' }])
+    await clock.advance(2 * HOUR)
+    expect(w.state().armed).toBe(true)
+    expect(w.state().maxHours).toBe(3)
+    expect(w.state().expiresAtEpoch).toBeLessThanOrEqual(Math.floor((START + 3 * HOUR) / 1000))
+    await clock.advance(2 * HOUR)
+    expect(w.state().armed).toBe(false)
+    expect(w.state().note).toMatch(/maximum of 3h00m reached/)
+  })
+
+  test('a ping does not move lastActivityAt, even when the ping call itself emits turn events', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm, warm])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    const before = w.state().lastActivityAtEpoch
+    expect(before).toBe(Math.floor(START / 1000))
+    w.onFork(async () => {
+      for await (const _ of $.turn.step(step())) { /* drain */ }
+      await $.turn.complete(answer())
+    })
+    await clock.advance(55 * MIN)
+    expect(w.forks.length).toBeGreaterThanOrEqual(1)
+    expect(w.state().lastPingAtEpoch).toBeGreaterThan(before)
+    expect(w.state().lastActivityAtEpoch).toBe(before)
+  })
+
   test('a failed mv removes the temp file, records an error file, and a later success clears it', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])
@@ -319,6 +368,53 @@ describe('bun-warmer', () => {
     expect(w.state()).toBe(null)
     expect([...w.files.keys()].some(k => k.endsWith('.tmp'))).toBe(false)
     expect(JSON.parse(w.files.get('/home/t/.claude/bun-warmer/S1.error.json') ?? 'null').error).toMatch(/write failed/)
+  })
+
+  test('a double failure removes the old state file; if that fails too the status line and log say so', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    expect(w.state()).not.toBe(null)
+    w.fail.mv = true
+    w.fail.errWrite = true
+    await clock.advance(5 * MIN)
+    await $.turn.complete(answer())
+    expect(w.state()).toBe(null) // the old final file was removed, so it cannot pass for current
+    expect(w.logs.some(l => /removed the old state file/.test(l))).toBe(true)
+    // now the removal fails as well: the old file stays, and the mod says so
+    w.fail.mv = false
+    w.fail.errWrite = false
+    await $.turn.complete(answer())
+    expect(w.state()).not.toBe(null)
+    const oldMs = w.state().writtenAtEpochMs
+    w.fail.mv = true
+    w.fail.errWrite = true
+    w.fail.rmFinal = true
+    await clock.advance(1500)
+    await $.turn.complete(answer())
+    expect(w.state().writtenAtEpochMs).toBe(oldMs)
+    expect(w.status.at(-1)).toMatch(/STATE FILE NOT WRITTEN and the old one could not be removed/)
+    expect(w.logs.some(l => /could not be removed/.test(l))).toBe(true)
+    w.fail.mv = false; w.fail.errWrite = false; w.fail.rmFinal = false
+    await $.turn.complete(answer())
+    expect(w.state().writtenAtEpochMs).toBeGreaterThan(oldMs)
+    expect(w.status.at(-1) ?? '').not.toMatch(/NOT WRITTEN/)
+  })
+
+  test('writtenAt has millisecond precision, with epoch milliseconds', async ($, on) => {
+    mock.clock(on, { now: START + 123 })
+    const w = world(on, [])
+    await $.session.start(start)
+    expect(w.state().writtenAt).toMatch(/T\d\d:\d\d:\d\d\.123[+-]\d\d:\d\d$/)
+    expect(w.state().writtenAtEpochMs).toBe(START + 123)
+  })
+
+  test('a lone surrogate encodes as U+FFFD bytes, and valid characters as their UTF-8 bytes', async () => {
+    expect(safeName('a\uD800b')).toBe('a%EF%BF%BDb')
+    expect(safeName('\uDC00')).toBe('%EF%BF%BD')
+    expect(safeName('é')).toBe('%C3%A9')
+    expect(safeName('\u{1F600}')).toBe('%F0%9F%98%80')
+    expect(safeName('a\uD800')).not.toMatch(/%D800/)
   })
 
   test('the session id becomes an injective file name', async () => {

@@ -100,7 +100,7 @@ describe('stall watchdog', () => {
     expect(w.state().stalledAgents).toEqual([])
   })
 
-  test('a long tool call is not flagged inside the threshold; events reset the clock', async ($, on) => {
+  test('events from a running agent reset the stall clock', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on)
     await $.session.start(start)
@@ -111,6 +111,59 @@ describe('stall watchdog', () => {
     }
     expect(w.sent.length).toBe(0)
     expect(w.state().stalledAgents ?? []).toEqual([])
+  })
+
+  test('a real long tool call: no stall while it is in flight past the threshold, activity marked on completion, then a true stall is flagged', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on)
+    let release: () => void = () => {}
+    on('tool.call', () => new Promise(res => { release = () => res({ result: 'done', text: 'done' } as never) }))
+    await $.session.start(start)
+    w.setAgents([sub()])
+    const call = ($.tool.call as (i: unknown) => Promise<unknown>)({ tool: 'Bash', command: 'make', agentId: 'a1' })
+    await clock.advance(45 * MIN) // more than twice the 20-minute threshold, with no events at all
+    expect(w.sent.length).toBe(0)
+    expect(w.state().stalledAgents ?? []).toEqual([])
+    release()
+    await call
+    await clock.advance(10 * MIN) // the completion restarted the clock: 10 minutes is under the threshold
+    expect(w.sent.length).toBe(0)
+    await clock.advance(25 * MIN) // running, no events, no tool in flight
+    expect(w.sent.length).toBe(1)
+    expect(w.state().stalledAgents[0].id).toBe('a1')
+  })
+
+  test('a true stall: running, no events, no tool in flight is flagged', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on)
+    await $.session.start(start)
+    w.setAgents([sub()])
+    await clock.advance(40 * MIN)
+    expect(w.sent.length).toBe(1)
+    expect(w.state().stalledAgents.length).toBe(1)
+  })
+
+  test('/bunwarm off stops the watchdog: no message and no stall record afterwards', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on)
+    await $.session.start(start)
+    w.setAgents([sub()])
+    await $.command.run({ command: 'bunwarm', args: 'off', origin: { kind: 'composer' } } as never)
+    expect(w.state().armed).toBe(false)
+    await clock.advance(3 * 60 * MIN)
+    expect(w.sent.length).toBe(0)
+    expect(w.state().stalledAgents).toEqual([])
+  })
+
+  test('window expiry stops the watchdog', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, { BUN_WARMER_WINDOW_HOURS: '1' })
+    await $.session.start(start)
+    await clock.advance(70 * MIN) // expired, no agents yet
+    expect(w.state().armed).toBe(false)
+    w.setAgents([sub()])
+    await clock.advance(2 * 60 * MIN)
+    expect(w.sent.length).toBe(0)
   })
 
   test('only running agents are flagged', async ($, on) => {
