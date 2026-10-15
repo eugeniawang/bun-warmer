@@ -154,7 +154,7 @@ Steps:
 ```
 
 3. Start a new Claude Code session (a running session does not pick up a settings change).
-4. Confirm it is running: type `/bunwarm`. It answers `bun-warmer on, ... left`. The status line reads `bun-warmer · warm · 1h25m left · ping in 50m`: the state is `idle` before the first turn, `warm`, or `cold` (60 minutes with no activity or ping). Also check that `~/.claude/bun-warmer/<session-id>.json` exists.
+4. Confirm it is running: type `/bunwarm`. It answers `bun-warmer on, ... left`. Before the first turn the status line reads `bun-warmer · idle · 1h30m left · waiting for the first turn`; after a turn it reads like `bun-warmer · warm · 1h25m left · ping in 50m`. The state is `idle`, `warm`, or `cold` (60 minutes with no activity or ping). Also check that `~/.claude/bun-warmer/<session-id>.json` exists.
 
 To undo: remove the `CLAUDE_CODE_PLUGIN_DIRS` line from `~/.claude/settings.json` (or stop passing `--plugin-dir`), run `claude plugin enable cache-tax@claude-code-mods`, and start a new session. `/bunwarm off` stops Bun Warmer for the current session only.
 

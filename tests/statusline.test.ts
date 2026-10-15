@@ -56,11 +56,12 @@ describe('status line: state, time left, next ping', () => {
   })
 
   test('quiet hours: still a one-line status with state and time left', async ($, on) => {
-    mock.clock(on, { now: at(2026, 10, 14, 22, 30) })
+    const clock = mock.clock(on, { now: at(2026, 10, 14, 22, 30) })
     const w = world(on, { BUN_WARMER_WINDOW_HOURS: '3' })
     await $.session.start(start)
     await $.turn.complete(answer())
-    expect(w.status.at(-1)).toMatch(/^bun-warmer · warm · 3h00m left · /)
+    await clock.advance(51 * MIN) // 23:21: the 23:20 ping was due in quiet hours and skipped
+    expect(w.status.at(-1)).toMatch(/^bun-warmer · warm · 2h10m left · quiet hours, pings resume 06:00$/)
     expect(w.status.at(-1)).not.toContain('\n')
   })
 })
