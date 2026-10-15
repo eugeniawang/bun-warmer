@@ -1,6 +1,8 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { ModelForkResult, On, PromptOrigin, TurnCompleteInput, TurnStepInput } from 'claude-code'
 
+import { safeName } from '../hooks/register'
+
 tier('user')
 
 const MIN = 60 * 1000
@@ -18,16 +20,29 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   const logs: string[] = []
   const prompts: string[] = []
   let agents: Array<{ status: string }> = []
+  let sid = 'S1'
+  let ctxTokens = 200000
+  const fail = { mv: false, write: false }
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
-  on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
+  on('fs.write', ($, e) => {
+    if (fail.write && e.path.endsWith('.tmp')) throw new Error('disk full')
+    files.set(e.path, e.text); return { value: undefined }
+  })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv
-    if (cmd === 'mv') { finals.set(to, files.get(from) ?? ''); files.delete(from) }
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const done = (exitCode: number, stderr = '') => ({ value: { exitCode, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+    if (cmd === 'mv') {
+      if (fail.mv) return done(1, 'Permission denied')
+      finals.set(to, files.get(from) ?? ''); files.delete(from)
+    }
+    if (cmd === 'rm') { files.delete(from); files.delete(to); finals.delete(to) }
+    return done(0)
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'S1' }))
-  on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 200000 }, rateLimits: [] } }))
+  on('session.id', () => ({ value: sid }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'hi', toolUses: [] }] as never }))
+  on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] as never }))
+  on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: ctxTokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: agents as never }))
   on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
@@ -45,7 +60,10 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   })
   return {
     forks, status, logs, prompts,
-    state: () => JSON.parse(finals.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any>,
+    state: (id = 'S1') => JSON.parse(finals.get(`/home/t/.claude/bun-warmer/${id}.json`) ?? 'null') as Record<string, any>,
+    fail, files, finals,
+    setSid: (id: string) => { sid = id },
+    setCtx: (n: number) => { ctxTokens = n },
     setAgents: (a: Array<{ status: string }>) => { agents = a },
   }
 }
@@ -151,7 +169,7 @@ describe('bun-warmer', () => {
     expect(w.state().refusals).toBe(1)
   })
 
-  test('a cold session passes every non-human prompt through, even in refuse mode', async ($, on) => {
+  test('a cold session passes every non-human prompt through, even in refuse mode', { options: { guard: 'refuse' } }, async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])
     await $.session.start(start)
@@ -193,5 +211,141 @@ describe('bun-warmer', () => {
     expect(w.state().guardDrops).toBe(1)
     await clock.advance(2 * HOUR)
     expect((await $.prompt.submit(say('report', { kind: 'task-notification' }))).drop).toBe(undefined)
+  })
+
+  test('/clear resets the session: new id, no stale context, old file left disarmed', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(30 * MIN)
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } } as never)
+    expect(w.state('S1').armed).toBe(false)
+    expect(w.state('S1').note).toBe('cleared')
+    w.setSid('S2')
+    await clock.advance(2 * HOUR)
+    // stale ctx (200k) and stale lastActivityAt must not trigger a cold-send refusal in the fresh session
+    const r = await $.prompt.submit(say('fresh start', composer))
+    expect(r.drop).toBe(undefined)
+    const st = w.state('S2')
+    expect(st.sessionId).toBe('S2')
+    expect(st.armed).toBe(true)
+    expect(st.guardDrops).toBe(0)
+    expect(st.refusals).toBe(0)
+    expect(st.lastPing).toBe(null)
+    expect(w.state('S1').sessionId).toBe('S1')
+    expect(w.state('S1').armed).toBe(false)
+  })
+
+  test('resume: a new session.start under another id starts clean', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.state('S1').refusals + (w.state('S1').lastPing ? 1 : 0)).toBeGreaterThan(0)
+    await $.session.end({ reason: 'resume', sessionId: 'S1', resume: { id: 'S1' } } as never)
+    w.setSid('S2')
+    await $.session.start(start)
+    const st = w.state('S2')
+    expect(st.sessionId).toBe('S2')
+    expect(st.armed).toBe(true)
+    expect(st.lastPing).toBe(null)
+    expect(st.refusals).toBe(0)
+    expect(st.stalledAgents).toEqual([])
+    expect(w.state('S1').armed).toBe(false)
+  })
+
+  test('compaction clears the context size so the guard cannot act on it until a response sets it', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(2 * HOUR + 30 * MIN)
+    await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'long history', toolUses: [] }] })
+    // the usage call still returns the stale pre-compaction number, but nothing re-reads it before the next response
+    const r = await $.prompt.submit(say('after compact', composer))
+    expect(r.drop).toBe(undefined)
+    expect(w.state().guardDrops).toBe(0)
+    // a response sets the new size; a later cold send is guarded again
+    w.setCtx(80000)
+    await $.turn.complete(answer())
+    await clock.advance(2 * HOUR)
+    expect((await $.prompt.submit(say('again', composer))).drop).toMatch(/Send it again/)
+  })
+
+  test('an active subagent at window expiry extends the window instead of closing it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm, warm, warm, warm, warm], { BUN_WARMER_INTERVAL_MIN: '50', BUN_WARMER_WINDOW_HOURS: '1' })
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    w.setAgents([{ status: 'running' }])
+    await clock.advance(70 * MIN)
+    expect(w.state().armed).toBe(true)
+    expect(w.state().expiresAtEpoch).toBeGreaterThan(Math.floor((START + 60 * MIN) / 1000))
+    w.setAgents([])
+    await clock.advance(3 * HOUR)
+    expect(w.state().armed).toBe(false)
+  })
+
+  test('a failed mv removes the temp file, records an error file, and a later success clears it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    const dir = '/home/t/.claude/bun-warmer'
+    await $.session.start(start)
+    expect(w.state().armed).toBe(true)
+    const okWrittenAt = w.state().writtenAtEpoch
+    expect(okWrittenAt).toBe(Math.floor(START / 1000))
+    w.fail.mv = true
+    await clock.advance(5 * MIN)
+    await $.turn.complete(answer())
+    expect([...w.files.keys()].some(k => k.endsWith('.tmp'))).toBe(false)
+    const err = JSON.parse(w.files.get(`${dir}/S1.error.json`) ?? 'null')
+    expect(err.error).toMatch(/mv failed: Permission denied/)
+    expect(w.logs.some(l => /could not write the state file/.test(l))).toBe(true)
+    // the old final file is still there, but its writtenAt shows it is old
+    expect(w.state().writtenAtEpoch).toBe(okWrittenAt)
+    w.fail.mv = false
+    await $.turn.complete(answer())
+    expect(w.files.has(`${dir}/S1.error.json`)).toBe(false)
+    expect(w.state().writtenAtEpoch).toBeGreaterThan(okWrittenAt)
+  })
+
+  test('a failed write leaves no temp file and records an error file', async ($, on) => {
+    mock.clock(on, { now: START })
+    const w = world(on, [])
+    w.fail.write = true
+    await $.session.start(start)
+    expect(w.state()).toBe(null)
+    expect([...w.files.keys()].some(k => k.endsWith('.tmp'))).toBe(false)
+    expect(JSON.parse(w.files.get('/home/t/.claude/bun-warmer/S1.error.json') ?? 'null').error).toMatch(/write failed/)
+  })
+
+  test('the session id becomes an injective file name', async () => {
+    expect(safeName('a/b')).not.toBe(safeName('a?b'))
+    expect(safeName('a_b')).not.toBe(safeName('a/b'))
+    expect(safeName('a%2Fb')).not.toBe(safeName('a/b'))
+    expect(safeName('abc-123_X')).toBe('abc-123_X')
+    expect(safeName('../x')).not.toMatch(/[./]/)
+  })
+
+  test('bridge origin counts as a person: guarded and arms the window', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(2 * HOUR + 30 * MIN)
+    expect((await $.prompt.submit(say('from phone', { kind: 'bridge' } as PromptOrigin))).drop).toMatch(/Send it again/)
+    expect(w.state().guardDrops).toBe(1)
+  })
+
+  test('slash commands pass the guard even into a cold, large session', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(2 * HOUR + 30 * MIN)
+    expect((await $.prompt.submit(say('/compact', composer))).drop).toBe(undefined)
+    expect(w.state().guardDrops).toBe(0)
   })
 })

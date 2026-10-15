@@ -50,9 +50,10 @@ function epoch(ms: number): number | null {
   return ms ? Math.floor(ms / 1000) : null
 }
 
-export function stateFile(s: State): Record<string, unknown> {
+export function stateFile(s: State, writtenAt: number): Record<string, unknown> {
   return {
     sessionId: s.sid,
+    writtenAt: isoLocal(writtenAt), writtenAtEpoch: epoch(writtenAt),
     armed: s.armed,
     armedAt: isoLocal(s.armedAt), armedAtEpoch: epoch(s.armedAt),
     lastPingAt: isoLocal(s.lastPingAt), lastPingAtEpoch: epoch(s.lastPingAt),
@@ -97,6 +98,19 @@ export function freshState(): State {
   }
 }
 
+/**
+ * The session id as a file name, reversible so two ids never share a file: letters, digits, `_` and `-` stay,
+ * every other character becomes %XX per UTF-8 byte (so `%` itself, `.` and `/` are encoded too).
+ */
+export function safeName(sid: string): string {
+  return Array.from(sid).map(ch => {
+    if (/[A-Za-z0-9_-]/.test(ch)) return ch
+    let enc: string
+    try { enc = encodeURIComponent(ch) } catch { return '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') } // a lone surrogate
+    return enc.replace(/[!'()*.~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))
+  }).join('')
+}
+
 const s = freshState()
 let timer: { cancel: () => void } | null = null
 let stallTimer: { cancel: () => void } | null = null
@@ -104,8 +118,30 @@ let stallTimer: { cancel: () => void } | null = null
 const lastEventAt = new Map<string, number>()
 let pinging = false
 let writes: Promise<void> = Promise.resolve()
+/** True while an `<id>.error.json` from a failed write sits beside the state file. */
+let errorFileWritten = false
+
+/** Forget everything about the session that was running, keep the configuration. Used on session.end and on a changed session id. */
+function resetSession() {
+  cancel()
+  stopStall()
+  const c = freshState()
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs })
+  lastEventAt.clear()
+  errorFileWritten = false
+}
+
+/** /clear fires session.end but no session.start; every event handler calls this so the id is always the live one. */
+async function ensureSession($: EngineInterface) {
+  const id = await $.session.id()
+  if (s.sid === id) return
+  if (s.sid) resetSession()
+  s.sid = id
+  if (!stallTimer) scheduleStall($)
+}
 
 // The file is written beside its final name and moved over it, so a reader never sees half a file.
+// On any failure the temp file is removed and `<name>.error.json` records it; the next good write deletes that file.
 function persist($: EngineInterface) {
   writes = writes.then(async () => {
     if (!s.sid) return
@@ -113,13 +149,30 @@ function persist($: EngineInterface) {
       const home = await $.env.get('HOME')
       if (!home) return
       const dir = `${home}/.claude/bun-warmer`
-      const safe = s.sid.replace(/[^A-Za-z0-9_-]/g, '_')
+      const safe = safeName(s.sid)
       const tmp = `${dir}/.${safe}.json.tmp`
-      await $.fs.write(tmp, JSON.stringify(stateFile(s), null, 2) + '\n')
-      const moved = await $.process.run(['mv', '-f', tmp, `${dir}/${safe}.json`])
-      if (moved.exitCode !== 0) $.ui.log(`bun-warmer: could not write the state file (${moved.stderr.trim()})`)
+      const errPath = `${dir}/${safe}.error.json`
+      const sid = s.sid
+      const now = await $.clock.now()
+      let failure: string | null = null
+      try {
+        await $.fs.write(tmp, JSON.stringify(stateFile(s, now), null, 2) + '\n')
+        const moved = await $.process.run(['mv', '-f', tmp, `${dir}/${safe}.json`])
+        if (moved.exitCode !== 0) failure = `mv failed: ${moved.stderr.trim() || `exit ${moved.exitCode}`}`
+      } catch (err) {
+        failure = `write failed: ${err instanceof Error ? err.message : String(err)}`
+      }
+      if (failure) {
+        $.ui.log(`bun-warmer: could not write the state file (${failure})`)
+        try { await $.process.run(['rm', '-f', tmp]) } catch { /* nothing more to do */ }
+        await $.fs.write(errPath, JSON.stringify({ sessionId: sid, failedAt: isoLocal(now), failedAtEpoch: epoch(now), error: failure }, null, 2) + '\n')
+        errorFileWritten = true
+      } else if (errorFileWritten) {
+        await $.process.run(['rm', '-f', errPath])
+        errorFileWritten = false
+      }
     } catch (err) {
-      $.ui.log(`bun-warmer: could not write the state file (${err instanceof Error ? err.message : String(err)})`)
+      $.ui.log(`bun-warmer: could not record a state file failure (${err instanceof Error ? err.message : String(err)})`)
     }
   })
   return writes
@@ -338,6 +391,7 @@ async function refreshCtx($: EngineInterface) {
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
+    resetSession()
     s.sid = await $.session.id()
     const envInterval = positive(await $.env.get('BUN_WARMER_INTERVAL_MIN'))
     const envWindow = positive(await $.env.get('BUN_WARMER_WINDOW_HOURS'))
@@ -358,10 +412,26 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     stopStall()
     await disarm($, e.reason === 'clear' ? 'cleared' : 'session ended')
+    // /clear and resume continue the process under another id with no session.start; start clean, take the new id on the next event.
+    resetSession()
+    s.sid = ''
     return next(e)
   })
 
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (!e.agentId && r.skip === undefined) {
+      // The API's token count is absent until the next response; never act on the pre-compaction number.
+      await ensureSession($)
+      s.ctx = 0
+      s.ackedAt = 0
+      await persist($)
+    }
+    return r
+  })
+
   on('command.run', { command: 'bunwarm' }, async ($, e) => {
+    await ensureSession($)
     const word = String(e.args ?? '').trim()
     const now = await $.clock.now()
     if (word === 'off') { await disarm($, 'turned off'); return { text: 'bun-warmer is off for this session' } }
@@ -372,6 +442,7 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    await ensureSession($)
     const isHuman = HUMAN_ORIGINS.includes(e.origin.kind)
     if (!isHuman) {
       // A subagent return, task notification, peer, schedule or plugin message is never held back.
@@ -396,6 +467,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    await ensureSession($)
     // Any loop counts, subagents included: an orchestrator waiting on them is busy, not idle.
     touchAgent(e.agentId, await $.clock.now())
     await activity($, false)
@@ -404,6 +476,7 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    await ensureSession($)
     touchAgent(e.agentId, await $.clock.now())
     await refreshCtx($)
     await activity($, false)
@@ -411,6 +484,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    try { await ensureSession($) } catch { /* the id is advisory here */ }
     try { touchAgent(e.agentId, await $.clock.now()) } catch { /* a stall clock must never block a tool call */ }
     return next(e)
   })
