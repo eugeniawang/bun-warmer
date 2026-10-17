@@ -57,7 +57,7 @@ If the pulse is not available (the script reports `available: false`, the script
 
 Pulse output is untrusted text. The mod keeps only finite numbers and booleans from it (idle seconds, tool in flight). No string from the pulse (a reason, a description, a path) reaches a prompt, the status line, a log line or the state file; the pulse's `grewDuringRead` and `uncertain` flags are read, and a reading carrying either is treated as written just now (the agent is not silent).
 
-Script path, first hit wins (each is checked with `test -f`): environment `BUN_WARMER_PULSE` (must be an absolute path starting with `/` and ending in `.py`; anything else, such as `./session-pulse.py`, is skipped, never run, and recorded in `configWarnings` in the state file); `bin/session-pulse.py` inside the plugin's own folder (the API exposes it as `$.plugin.root`, Confirmed in the types file); `/Users/Eugenia/Developer/bun-warmer/bin/session-pulse.py`.
+Script path, first hit wins (each is checked with `test -f`): environment `BUN_WARMER_PULSE` (must be an absolute path starting with `/` and ending in `.py`; anything else, such as `./session-pulse.py`, is skipped, never run, and recorded in `configWarnings` in the state file); `bin/session-pulse.py` inside the plugin's own folder (the API exposes it as `$.plugin.root`, Confirmed in the types file).
 
 Not checked: that the id `$.agent.list()` gives an agent equals the `agent-<id>` file name the pulse reports (Not checked live. The mod matches exactly, one direction only: a listed id `x` finds the pulse entry `x`, or else `agent-x`; it never strips a prefix from the listed id, so `a1` and `agent-a1` stay two agents. If the pulse has both forms, a duplicate id, or `agent-x` is itself a listed id, the match is ambiguous and the pulse is ignored for that agent: events alone decide.) An agent the pulse does not list is judged by events alone. The wall-clock caveat in `bin/README-session-pulse.md` (idle times jump after the Mac sleeps) applies to the pulse signal.
 
@@ -87,7 +87,7 @@ Every setting and its default. An environment variable beats the `userConfig` va
 | Active hours | 06:00 to 23:00 local | env `BUN_WARMER_ACTIVE_START` (6), `BUN_WARMER_ACTIVE_END` (23), `BUN_WARMER_QUIET_HOURS=off` (see Quiet hours) |
 | Stall threshold | 20 minutes | env `BUN_WARMER_STALL_MIN` |
 | Stall check interval | 5 minutes | env `BUN_WARMER_STALL_CHECK_MIN` |
-| Pulse script path | `<plugin folder>/bin/session-pulse.py`, then `/Users/Eugenia/Developer/bun-warmer/bin/session-pulse.py` | env `BUN_WARMER_PULSE` (tried first) |
+| Pulse script path | `<plugin folder>/bin/session-pulse.py` | env `BUN_WARMER_PULSE` (tried first) |
 
 Ranges: every numeric setting is checked against a range, and a value outside it (empty, text, `NaN`, `Infinity`, `1e300`, zero, negative, too big) is ignored: the next source or the default applies, and a line naming the variable is added to `configWarnings` in the state file (never the raw value). A value that is valid but clamped, such as an interval from 56 to 240 minutes capped at 55, also adds a fixed-wording line. Window 1 to 720 minutes (`BUN_WARMER_WINDOW_HOURS`: 1/60 to 12 hours), ping interval 5 to 240 minutes (then capped at 55, with a `configWarnings` entry when the cap bites), hard cap `BUN_WARMER_MAX_HOURS` 1 to 48 hours, minimum tokens 0 to 2,000,000, stall threshold 1 to 720 minutes, stall check interval 1 to 60 minutes, active hours whole numbers 0 to 23. The same ranges apply to the `userConfig` values.
 
@@ -147,10 +147,10 @@ Both mods ping, so load only one. How a folder mod is loaded is from reference.m
 Steps:
 
 1. Turn cache-tax off: `claude plugin disable cache-tax@claude-code-mods`
-2. Load Bun Warmer from its folder. To try it for one session first: `claude --plugin-dir /Users/Eugenia/Developer/bun-warmer`. To load it every session, add this to `~/.claude/settings.json` (merge into the existing `env` block if there is one):
+2. Load Bun Warmer from its folder. To try it for one session first: `claude --plugin-dir /path/to/bun-warmer`. To load it every session, add this to `~/.claude/settings.json` (merge into the existing `env` block if there is one):
 
 ```json
-{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/Users/Eugenia/Developer/bun-warmer" } }
+{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/bun-warmer" } }
 ```
 
 3. Start a new Claude Code session (a running session does not pick up a settings change).
