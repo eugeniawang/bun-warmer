@@ -338,10 +338,7 @@ describe('pulse as a second stall signal', () => {
     await $.session.start(start)
     w.setAgents([sub()])
     await clock.advance(5 * MIN)
-    const order = w.tested.slice(0, 2)
-    expect(order[0]).toBe('/x/pulse.py')
-    expect(order[1]).toBe(PULSE_PATH)
-    expect(order.length).toBe(2)
+    expect(w.tested).toEqual(['/x/pulse.py', PULSE_PATH])
     expect(w.pythonCalls).toEqual([]) // neither candidate exists, so nothing is executed
   })
 

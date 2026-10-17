@@ -530,7 +530,7 @@ function pulseFor(agents: Map<string, PulseAgent | null>, id: string, listed: Re
 /** The plugin-root candidate for session-pulse.py. A relative root would resolve against the session's project directory, which can hold anyone's bin/session-pulse.py: absolute only, trailing slashes stripped. */
 export function pluginPulseCandidate(root: unknown): { path: string | null; warning: string | null } {
   if (typeof root === 'string' && root.startsWith('/')) return { path: `${root.replace(/\/+$/, '')}/bin/session-pulse.py`, warning: null }
-  if (root) return { path: null, warning: 'Plugin root ignored: it must be an absolute path (starting with /), so the pulse script is not looked up there' }
+  if (root !== undefined && root !== null) return { path: null, warning: 'Plugin root ignored: it must be an absolute path (starting with /), so the pulse script is not looked up there' }
   return { path: null, warning: null }
 }
 
