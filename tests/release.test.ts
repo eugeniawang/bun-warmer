@@ -60,7 +60,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   on('prompt.submit', ($, e) => { sent.push(e.text); return { text: e.text } })
   on('model.fork', async () => {
     forks.push(forks.length)
-    return { value: { isAnswered: true, text: 'warm', usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 200000, cache_creation_input_tokens: 10 } } as ModelForkResult }
+    return { value: { isAnswered: true, text: 'warm', usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 200000, cache_creation_input_tokens: 10, model: 'claude-opus-5' } } as ModelForkResult }
   })
   return {
     status, logs, sent, forks, tested, pythonCalls,
@@ -83,12 +83,12 @@ const sub = (): Agent => ({ id: 'a1', description: 'build thing', type: 'general
 const pulseOf = (idleSeconds: number, extra: Record<string, unknown> = {}) => ({ kind: 'json', body: { available: true, agents: [{ id: 'a1', idleSeconds, toolInFlight: false, ...extra }] } }) as PulseBehavior
 
 describe('window setting', () => {
-  test('the default window is 90 minutes', async ($, on) => {
+  test('the default window is 180 minutes', async ($, on) => {
     mock.clock(on, { now: START })
     const w = world(on)
     await $.session.start(start)
-    expect(w.state().expiresAtEpoch).toBe(Math.floor((START + 90 * MIN) / 1000))
-    expect(w.state().windowMin).toBe(90)
+    expect(w.state().expiresAtEpoch).toBe(Math.floor((START + 180 * MIN) / 1000))
+    expect(w.state().windowMin).toBe(180)
   })
 
   test('BUN_WARMER_WINDOW_MIN sets the window in minutes', async ($, on) => {
@@ -127,19 +127,33 @@ describe('window setting', () => {
     expect(w.state().windowMin).toBe(20)
   })
 
-  test('the window really ends at 90 minutes: pings stop and the mod disarms', async ($, on) => {
+  test('the window really ends at 180 minutes: pings stop and the mod disarms', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on)
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(51 * MIN)
     expect(w.forks.length).toBe(1)
-    await clock.advance(60 * MIN)
+    await clock.advance(140 * MIN)
     expect(w.state().armed).toBe(false)
     expect(w.state().note).toBe('window expired')
     const n = w.forks.length
     await clock.advance(3 * HOUR)
     expect(w.forks.length).toBe(n) // a ping never extends the window
+  })
+})
+
+describe('last ping cost', () => {
+  test('the state file records the ping model and its dollar cost', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on)
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    const lp = w.state().lastPing
+    expect(lp.model).toBe('claude-opus-5')
+    // 200000 read at $0.5, 10 written at $10, 2 plain input at $5, 1 output at $25, per million tokens
+    expect(lp.costUsd).toBe(0.100135)
   })
 })
 
@@ -199,7 +213,7 @@ describe('size gate', () => {
 
   const guardAt = async ($: any, on: On, ctx: number) => {
     const clock = mock.clock(on, { now: START })
-    const w = world(on, { ctx })
+    const w = world(on, { ctx, env: { BUN_WARMER_WINDOW_MIN: '90' } })
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(2 * HOUR + 30 * MIN)
