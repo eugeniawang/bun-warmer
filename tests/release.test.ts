@@ -6,7 +6,6 @@ tier('user')
 const MIN = 60 * 1000
 const HOUR = 60 * MIN
 const START = 1_800_000_000_000
-const FALLBACK = '/path/to/bun-warmer/bin/session-pulse.py'
 
 type Agent = { id: string; description: string; type: string; status: string }
 type PulseBehavior =
@@ -30,7 +29,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   let agents: Agent[] = []
   let ctx = opts.ctx ?? 200000
   let pulse: PulseBehavior = opts.pulse ?? { kind: 'raw', stdout: '' }
-  const existing = opts.existing ?? [FALLBACK]
+  const existing = opts.existing
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', async ($, e) => {
@@ -38,7 +37,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
     const [cmd, a1, a2] = e.argv
     if (cmd === 'mv') { finals.set(e.argv[3], files.get(a2) ?? ''); files.delete(a2); return done(0) }
     if (cmd === 'rm') return done(0)
-    if (cmd === 'test') { tested.push(e.argv[2]); return done(existing.includes(e.argv[2]) ? 0 : 1) }
+    if (cmd === 'test') { tested.push(e.argv[2]); return done((existing ? existing.includes(e.argv[2]) : /\/bin\/session-pulse\.py$/.test(e.argv[2])) ? 0 : 1) }
     if (cmd === 'python3') {
       pythonCalls.push([...e.argv])
       if (pulse.kind === 'hang') return new Promise(() => {})
@@ -331,21 +330,21 @@ describe('pulse as a second stall signal', () => {
     expect(w.state().stalledAgents.length).toBe(1) // events alone decide
   })
 
-  test('script path: env BUN_WARMER_PULSE first, then the plugin folder, then the fixed Developer path', async ($, on) => {
+  test('script path: env BUN_WARMER_PULSE first, then the plugin folder', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, { env: { BUN_WARMER_PULSE: '/x/pulse.py' }, pulse: pulseOf(5), existing: [] })
     await $.session.start(start)
     w.setAgents([sub()])
     await clock.advance(5 * MIN)
-    const order = w.tested.slice(0, 3)
+    const order = w.tested.slice(0, 2)
     expect(order[0]).toBe('/x/pulse.py')
     expect(order[1]).toMatch(/\/bin\/session-pulse\.py$/)
-    expect(order[2]).toBe(FALLBACK)
+    expect(order.length).toBe(2)
   })
 
   test('the script from BUN_WARMER_PULSE is the one run when it exists', async ($, on) => {
     const clock = mock.clock(on, { now: START })
-    const w = world(on, { env: { BUN_WARMER_PULSE: '/x/pulse.py' }, pulse: pulseOf(5), existing: ['/x/pulse.py', FALLBACK] })
+    const w = world(on, { env: { BUN_WARMER_PULSE: '/x/pulse.py' }, pulse: pulseOf(5), existing: ['/x/pulse.py'] })
     await $.session.start(start)
     w.setAgents([sub()])
     await clock.advance(5 * MIN)

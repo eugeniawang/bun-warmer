@@ -8,7 +8,6 @@ const MAX_INTERVAL_MIN = 55
 const DEFAULT_MIN_TOKENS = 50000
 const DEFAULT_WINDOW_MIN = 90
 const PULSE_TIMEOUT_MS = 10000
-const PULSE_FALLBACK_PATH = '/path/to/bun-warmer/bin/session-pulse.py'
 const PING_PROMPT = 'Reply with the single word: warm'
 const DEFAULT_ACTIVE_START = 6
 const DEFAULT_ACTIVE_END = 23
@@ -528,7 +527,7 @@ function pulseFor(agents: Map<string, PulseAgent | null>, id: string, listed: Re
   return agents.get(hits[0]) ?? undefined
 }
 
-/** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`), the fixed Developer path. `test -f` through argv, no shell. */
+/** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`). `test -f` through argv, no shell. */
 async function pulsePath($: EngineInterface): Promise<string | null> {
   const candidates: string[] = []
   try {
@@ -541,7 +540,6 @@ async function pulsePath($: EngineInterface): Promise<string | null> {
     }
   } catch { /* next */ }
   try { const root = $.plugin.root; if (root) candidates.push(`${root}/bin/session-pulse.py`) } catch { /* next */ }
-  candidates.push(PULSE_FALLBACK_PATH)
   for (const c of candidates) {
     try {
       if ((await $.process.run(['test', '-f', c], { timeoutMs: 2000 })).exitCode === 0) return c
