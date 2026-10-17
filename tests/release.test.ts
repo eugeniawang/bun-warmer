@@ -37,7 +37,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
     const [cmd, a1, a2] = e.argv
     if (cmd === 'mv') { finals.set(e.argv[3], files.get(a2) ?? ''); files.delete(a2); return done(0) }
     if (cmd === 'rm') return done(0)
-    if (cmd === 'test') { tested.push(e.argv[2]); return done((existing ? existing.includes(e.argv[2]) : /\/bin\/session-pulse\.py$/.test(e.argv[2])) ? 0 : 1) }
+    if (cmd === 'test') { tested.push(e.argv[2]); return done((existing ? existing.includes(e.argv[2]) : e.argv[2] === PULSE_PATH) ? 0 : 1) }
     if (cmd === 'python3') {
       pythonCalls.push([...e.argv])
       if (pulse.kind === 'hang') return new Promise(() => {})
@@ -72,6 +72,8 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   }
 }
 
+// Exact default: only the plugin root's own script exists unless a test says otherwise (the host's $.plugin.root is the repo root).
+const PULSE_PATH = `${import.meta.dir.replace(/\/tests$/, '')}/bin/session-pulse.py`
 const start = { surface: null, isInteractive: false, cwd: '/work' } as const
 const composer: PromptOrigin = { kind: 'composer' }
 const answer = (over: Partial<TurnCompleteInput> = {}) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', ...over }) as TurnCompleteInput
@@ -338,8 +340,9 @@ describe('pulse as a second stall signal', () => {
     await clock.advance(5 * MIN)
     const order = w.tested.slice(0, 2)
     expect(order[0]).toBe('/x/pulse.py')
-    expect(order[1]).toMatch(/\/bin\/session-pulse\.py$/)
+    expect(order[1]).toBe(PULSE_PATH)
     expect(order.length).toBe(2)
+    expect(w.pythonCalls).toEqual([]) // neither candidate exists, so nothing is executed
   })
 
   test('the script from BUN_WARMER_PULSE is the one run when it exists', async ($, on) => {
@@ -348,7 +351,18 @@ describe('pulse as a second stall signal', () => {
     await $.session.start(start)
     w.setAgents([sub()])
     await clock.advance(5 * MIN)
+    expect(w.tested[0]).toBe('/x/pulse.py')
     expect(w.pythonCalls[0]).toEqual(['python3', '/x/pulse.py', 'S1'])
+  })
+
+  test('with no env path, exactly the plugin-root script is checked and executed', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, { pulse: pulseOf(5) })
+    await $.session.start(start)
+    w.setAgents([sub()])
+    await clock.advance(5 * MIN)
+    expect(w.tested[0]).toBe(PULSE_PATH)
+    expect(w.pythonCalls[0]).toEqual(['python3', PULSE_PATH, 'S1'])
   })
 
   test('no pulse is requested while no agent is running', async ($, on) => {
