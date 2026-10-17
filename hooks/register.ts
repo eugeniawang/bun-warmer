@@ -6,7 +6,7 @@ const DEFAULT_MAX_HOURS = 12
 const COLD_AFTER_MS = 60 * MIN
 const MAX_INTERVAL_MIN = 55
 const DEFAULT_MIN_TOKENS = 50000
-const DEFAULT_WINDOW_MIN = 90
+const DEFAULT_WINDOW_MIN = 180
 const PULSE_TIMEOUT_MS = 10000
 const PING_PROMPT = 'Reply with the single word: warm'
 const DEFAULT_ACTIVE_START = 6
@@ -24,7 +24,28 @@ type StalledAgent = { id: string; description: string; type: string; minutesSile
 /** What the last stall check learned from the transcript pulse. Only our own fixed reason words, never text taken from the pulse. */
 type PulseRecord = { available: boolean; reason: string | null; checkedAt: number; agentsSeen: number }
 
-type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null }
+type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null; model?: string | null; usd?: number | null }
+
+// $ per million tokens, [cache read, 1h cache write, output], list prices September 2026 (same table cache-tax uses).
+// Longer family names first: a model id matches the first row it contains.
+const PRICES: Array<[string, number, number, number]> = [
+  ['fable-5-1', 0.25, 20, 50],
+  ['fable-5', 1, 20, 50],
+  ['opus-5', 0.5, 10, 25],
+  ['opus-4', 0.5, 10, 25],
+  ['sonnet-5', 0.2, 4, 10],
+  ['sonnet', 0.3, 6, 15],
+  ['haiku', 0.1, 2, 5],
+]
+
+/** What one ping cost: cache read at the read rate, cache write at the write rate, plain input at half the write rate, output at the output rate. Null when the model is unknown. */
+export function pingUsd(model: string | null, u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): number | null {
+  const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
+  const row = PRICES.find(([family]) => m.includes(family))
+  if (!row) return null
+  const [read, write, output] = row.slice(1) as [number, number, number]
+  return (u.cache_read_input_tokens * read + u.cache_creation_input_tokens * write + u.input_tokens * write / 2 + u.output_tokens * output) / 1e6
+}
 
 type State = {
   sid: string
@@ -100,6 +121,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     lastPing: s.lastPing && {
       at: isoLocal(s.lastPing.at), atEpoch: epoch(s.lastPing.at), ok: s.lastPing.ok, reason: s.lastPing.reason,
       cacheReadTokens: s.lastPing.read, cacheWriteTokens: s.lastPing.write,
+      model: s.lastPing.model ?? null, costUsd: s.lastPing.usd ?? null,
     },
     statusText: s.statusText, statusState: s.statusState,
     nextPingAt: isoLocal(s.nextPingAt), nextPingAtEpoch: epoch(s.nextPingAt),
@@ -751,9 +773,12 @@ async function ping($: EngineInterface, now: number) {
     } else {
       const u = reply.usage
       const warm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
+      let model: string | null = typeof (u as { model?: unknown }).model === 'string' ? (u as { model: string }).model : null
+      if (!model) { try { model = (await $.session.model()) ?? null } catch { model = null } }
+      const usd = pingUsd(model, u)
       result = warm
-        ? { at: now, ok: true, reason: null, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens }
-        : { at: now, ok: false, reason: `the cache was already gone (read ${u.cache_read_input_tokens}, wrote ${u.cache_creation_input_tokens} tokens)`, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens }
+        ? { at: now, ok: true, reason: null, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, model, usd }
+        : { at: now, ok: false, reason: `the cache was already gone (read ${u.cache_read_input_tokens}, wrote ${u.cache_creation_input_tokens} tokens)`, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, model, usd }
     }
   } finally {
     // resetSession already cleared the flag, and a newer ping may own it now.
@@ -825,7 +850,7 @@ export const register: Register = (on, options) => {
     const wantedInterval = envInterval ?? optInterval
     if (wantedInterval > MAX_INTERVAL_MIN) warnings.push(`ping interval capped at ${MAX_INTERVAL_MIN} minutes: a longer interval would let the cache go cold`)
     s.intervalMs = Math.min(wantedInterval, MAX_INTERVAL_MIN) * MIN
-    // Precedence: env WINDOW_HOURS (the old name, an override when set), then env WINDOW_MIN, then the userConfig windowMin, then 90.
+    // Precedence: env WINDOW_HOURS (the old name, an override when set), then env WINDOW_MIN, then the userConfig windowMin, then 180.
     s.windowMs = envWindowHours !== null ? envWindowHours * HOUR : (envWindowMin ?? optWindowMin) * MIN
     s.minTokens = envMinTokens ?? optMinTokens
     s.maxMs = (num('BUN_WARMER_MAX_HOURS', ...RANGE.maxHours) ?? DEFAULT_MAX_HOURS) * HOUR
