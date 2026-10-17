@@ -527,6 +527,13 @@ function pulseFor(agents: Map<string, PulseAgent | null>, id: string, listed: Re
   return agents.get(hits[0]) ?? undefined
 }
 
+/** The plugin-root candidate for session-pulse.py. A relative root would resolve against the session's project directory, which can hold anyone's bin/session-pulse.py: absolute only, trailing slashes stripped. */
+export function pluginPulseCandidate(root: unknown): { path: string | null; warning: string | null } {
+  if (typeof root === 'string' && root.startsWith('/')) return { path: `${root.replace(/\/+$/, '')}/bin/session-pulse.py`, warning: null }
+  if (root) return { path: null, warning: 'Plugin root ignored: it must be an absolute path (starting with /), so the pulse script is not looked up there' }
+  return { path: null, warning: null }
+}
+
 /** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`). `test -f` through argv, no shell. */
 async function pulsePath($: EngineInterface): Promise<string | null> {
   const candidates: string[] = []
@@ -539,7 +546,11 @@ async function pulsePath($: EngineInterface): Promise<string | null> {
       if (!s.warnings.includes(note)) s.warnings.push(note)
     }
   } catch { /* next */ }
-  try { const root = $.plugin.root; if (root) candidates.push(`${root}/bin/session-pulse.py`) } catch { /* next */ }
+  try {
+    const { path, warning } = pluginPulseCandidate($.plugin.root)
+    if (path) candidates.push(path)
+    if (warning && !s.warnings.includes(warning)) s.warnings.push(warning)
+  } catch { /* next */ }
   for (const c of candidates) {
     try {
       if ((await $.process.run(['test', '-f', c], { timeoutMs: 2000 })).exitCode === 0) return c
