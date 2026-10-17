@@ -195,6 +195,16 @@ describe('the plugin root must be absolute', () => {
       expect(r.warning).toMatch(/Plugin root ignored/)
     })
   }
+  for (const bad of ['', 0, false, 42, {}]) {
+    test(`present non-path root ${JSON.stringify(bad)} gives no candidate and a warning`, () => {
+      const r = pluginPulseCandidate(bad)
+      expect(r.path).toBeNull()
+      expect(r.warning).toMatch(/Plugin root ignored/)
+    })
+  }
+  test('null root: no candidate, no warning', () => {
+    expect(pluginPulseCandidate(null)).toEqual({ path: null, warning: null })
+  })
   test('a trailing-slash root gives the exact path', () => {
     expect(pluginPulseCandidate('/opt/p//').path).toBe('/opt/p/bin/session-pulse.py')
     expect(pluginPulseCandidate('/opt/p').path).toBe('/opt/p/bin/session-pulse.py')
