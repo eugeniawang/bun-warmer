@@ -6,7 +6,7 @@ Usage: `session-pulse.py <session-id> [--projects-dir ~/.claude/projects] [--pre
 
 Exit 0 always except bad arguments (exit 2, including a session id with path separators or odd characters). When it cannot tell, it prints `{"available": false, "reason": ...}`. It never reports "quiet"; it reports idle seconds and the caller decides.
 
-## Layout observed on disk (Confirmed against a real session, 2026-10-14)
+## Layout observed on disk
 
 - Main transcript: `<projects-dir>/<encoded-cwd>/<session-id>.jsonl`
 - Subagents: `<projects-dir>/<encoded-cwd>/<session-id>/subagents/agent-<id>.jsonl`, with `agent-<id>.meta.json` beside each (keys seen: agentType, description, toolUseId, spawnDepth, requestShape, requestNonInteractive, model).
