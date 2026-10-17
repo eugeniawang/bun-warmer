@@ -8,7 +8,6 @@ const MAX_INTERVAL_MIN = 55
 const DEFAULT_MIN_TOKENS = 50000
 const DEFAULT_WINDOW_MIN = 90
 const PULSE_TIMEOUT_MS = 10000
-const PULSE_FALLBACK_PATH = '/path/to/bun-warmer/bin/session-pulse.py'
 const PING_PROMPT = 'Reply with the single word: warm'
 const DEFAULT_ACTIVE_START = 6
 const DEFAULT_ACTIVE_END = 23
@@ -529,7 +528,14 @@ function pulseFor(agents: Map<string, PulseAgent | null>, id: string, listed: Re
   return agents.get(hits[0]) ?? undefined
 }
 
-/** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`), the fixed Developer path. `test -f` through argv, no shell. */
+/** The plugin-root candidate for session-pulse.py. A relative root would resolve against the session's project directory, which can hold anyone's bin/session-pulse.py: absolute only, trailing slashes stripped. */
+export function pluginPulseCandidate(root: unknown): { path: string | null; warning: string | null } {
+  if (typeof root === 'string' && root.startsWith('/')) return { path: `${root.replace(/\/+$/, '')}/bin/session-pulse.py`, warning: null }
+  if (root !== undefined && root !== null) return { path: null, warning: 'Plugin root ignored: it must be an absolute path (starting with /), so the pulse script is not looked up there' }
+  return { path: null, warning: null }
+}
+
+/** Where session-pulse.py is, first hit of: env BUN_WARMER_PULSE, `<plugin folder>/bin/session-pulse.py` (`$.plugin.root`). `test -f` through argv, no shell. */
 async function pulsePath($: EngineInterface): Promise<string | null> {
   const candidates: string[] = []
   try {
@@ -541,8 +547,11 @@ async function pulsePath($: EngineInterface): Promise<string | null> {
       if (!s.warnings.includes(note)) s.warnings.push(note)
     }
   } catch { /* next */ }
-  try { const root = $.plugin.root; if (root) candidates.push(`${root}/bin/session-pulse.py`) } catch { /* next */ }
-  candidates.push(PULSE_FALLBACK_PATH)
+  try {
+    const { path, warning } = pluginPulseCandidate($.plugin.root)
+    if (path) candidates.push(path)
+    if (warning && !s.warnings.includes(warning)) s.warnings.push(warning)
+  } catch { /* next */ }
   for (const c of candidates) {
     try {
       if ((await $.process.run(['test', '-f', c], { timeoutMs: 2000 })).exitCode === 0) return c

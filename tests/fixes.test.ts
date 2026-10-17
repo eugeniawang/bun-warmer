@@ -1,4 +1,5 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
+import { pluginPulseCandidate } from '../hooks/register'
 import type { ModelForkResult, On, PromptOrigin, TurnCompleteInput, TurnStepInput } from 'claude-code'
 
 tier('user')
@@ -6,7 +7,6 @@ tier('user')
 const MIN = 60 * 1000
 const HOUR = 60 * MIN
 const START = 1_800_000_000_000
-const FALLBACK = '/path/to/bun-warmer/bin/session-pulse.py'
 
 type Agent = { id: string; description: string; type: string; status: string }
 type PulseBehavior =
@@ -30,7 +30,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   let agents: Agent[] = []
   let ctx = opts.ctx ?? 200000
   let pulse: PulseBehavior = opts.pulse ?? { kind: 'raw', stdout: '' }
-  const existing = opts.existing ?? [FALLBACK]
+  const existing = opts.existing
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', async ($, e) => {
@@ -38,7 +38,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
     const [cmd, a1, a2] = e.argv
     if (cmd === 'mv') { finals.set(e.argv[3], files.get(a2) ?? ''); files.delete(a2); return done(0) }
     if (cmd === 'rm') return done(0)
-    if (cmd === 'test') { tested.push(e.argv[2]); return done(existing.includes(e.argv[2]) ? 0 : 1) }
+    if (cmd === 'test') { tested.push(e.argv[2]); return done((existing ? existing.includes(e.argv[2]) : e.argv[2] === PULSE_PATH) ? 0 : 1) }
     if (cmd === 'python3') {
       pythonCalls.push([...e.argv])
       if (pulse.kind === 'hang') return new Promise(() => {})
@@ -74,6 +74,8 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   }
 }
 
+// Exact default: only the plugin root's own script exists unless a test says otherwise (the host's $.plugin.root is the repo root).
+const PULSE_PATH = `${import.meta.dir.replace(/\/tests$/, '')}/bin/session-pulse.py`
 const start = { surface: null, isInteractive: false, cwd: '/work' } as const
 const composer: PromptOrigin = { kind: 'composer' }
 const answer = (over: Partial<TurnCompleteInput> = {}) => ({ answer: 'ok', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', ...over }) as TurnCompleteInput
@@ -173,7 +175,7 @@ describe('BUN_WARMER_PULSE must be an absolute .py path', () => {
   for (const bad of ['./session-pulse.py', 'session-pulse.py', '../x/pulse.py', '/x/pulse.sh', '/x/pulse']) {
     test(`rejects ${bad}, never runs it, falls through, and records why`, async ($, on) => {
       const clock = mock.clock(on, { now: START })
-      const w = world(on, { env: { BUN_WARMER_PULSE: bad }, pulse: pulseOf(5), existing: [bad, FALLBACK] })
+      const w = world(on, { env: { BUN_WARMER_PULSE: bad }, pulse: pulseOf(5) })
       await $.session.start(start)
       w.setAgents([sub()])
       await clock.advance(5 * MIN)
@@ -183,6 +185,42 @@ describe('BUN_WARMER_PULSE must be an absolute .py path', () => {
       expect(w.state().configWarnings.join(' ')).toMatch(/BUN_WARMER_PULSE ignored/)
     })
   }
+})
+
+describe('the plugin root must be absolute', () => {
+  for (const rel of ['.', './plugin', 'plugin', '../x']) {
+    test(`relative root ${rel} gives no candidate (so it is never test -f'd or run) and a warning`, () => {
+      const r = pluginPulseCandidate(rel)
+      expect(r.path).toBeNull()
+      expect(r.warning).toMatch(/Plugin root ignored/)
+    })
+  }
+  for (const bad of ['', 0, false, 42, {}]) {
+    test(`present non-path root ${JSON.stringify(bad)} gives no candidate and a warning`, () => {
+      const r = pluginPulseCandidate(bad)
+      expect(r.path).toBeNull()
+      expect(r.warning).toMatch(/Plugin root ignored/)
+    })
+  }
+  test('null root: no candidate, no warning', () => {
+    expect(pluginPulseCandidate(null)).toEqual({ path: null, warning: null })
+  })
+  test('a trailing-slash root gives the exact path', () => {
+    expect(pluginPulseCandidate('/opt/p//').path).toBe('/opt/p/bin/session-pulse.py')
+    expect(pluginPulseCandidate('/opt/p').path).toBe('/opt/p/bin/session-pulse.py')
+  })
+  test('no root: no candidate, no warning', () => {
+    expect(pluginPulseCandidate(undefined)).toEqual({ path: null, warning: null })
+  })
+  test('the real run still tests and runs the absolute plugin-root script, with no warning', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, { pulse: pulseOf(5) })
+    await $.session.start(start)
+    w.setAgents([sub()])
+    await clock.advance(5 * MIN)
+    expect(w.tested[0]).toBe(PULSE_PATH)
+    expect(w.state().configWarnings.join(' ')).not.toMatch(/Plugin root ignored/)
+  })
 })
 
 describe('numeric settings are clamped', () => {
