@@ -1,12 +1,13 @@
 # Bun Warmer
 
-Bun Warmer is a Claude Code mod that keeps the prompt cache warm while you take a break. Claude Code caches your conversation for 60 minutes. If you step away longer than that, your next message re-writes the whole context at the cache-write rate, which is slow and costly in a large session. Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 90 minutes after your last prompt. It also watches for subagents that have gone silent and tells the main conversation about them.
+Bun Warmer is a mod for Claude Code users who take breaks during long sessions. Claude Code caches your conversation for 60 minutes. After a longer break, your next message re-writes the whole context at the cache-write rate, which is slow and costly. Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 90 minutes after your last prompt. It also flags subagents that go silent.
 
 Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal (MIT). Bun Warmer is written from scratch; none of its code is copied.
 
 ## Requirements
 
-- Claude Code 2.1.300 or newer. Bun Warmer uses function hooks from the mod (plugin) API, which is early access.
+- Claude Code with the function-hook mod (plugin) API, which is early access. The plugin does not declare a minimum version; it has been tested on Claude Code 2.1.302.
+- A POSIX host (macOS or Linux). Bun Warmer builds paths with `/` and runs `mv`, `rm` and `test`, so it does not run on Windows.
 - `python3` on your `PATH` for the transcript pulse script (`bin/session-pulse.py`, standard library only). Without it the stall watchdog still works from events alone.
 
 ## Install
@@ -16,6 +17,8 @@ Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal 
 ```
 git clone https://github.com/eugeniawang/bun-warmer.git /path/to/bun-warmer
 ```
+
+`/path/to/bun-warmer` is a placeholder used throughout this README. Replace it with the absolute path where you cloned the repo, for example `/Users/<your-username>/code/bun-warmer` on macOS or `/home/<your-username>/bun-warmer` on Linux; use an absolute path, not `~` or a relative one. If the path is wrong, the mod does not load and `/bunwarm` does not respond; if the mod loads but cannot find its pulse script, the state file shows `pulse.reason` as `script-missing`, and a plugin folder that is not absolute is listed in `configWarnings`.
 
 2. Try it for one session:
 
@@ -75,7 +78,7 @@ An environment variable beats the matching config menu value. The config menu fi
 | Keep-warm window | 90 minutes | env `BUN_WARMER_WINDOW_HOURS` (hours), else env `BUN_WARMER_WINDOW_MIN`, else config `windowMin` |
 | Hard cap on window extensions | 12 hours | env `BUN_WARMER_MAX_HOURS` |
 | Minimum context to ping or warn | 50,000 tokens | env `BUN_WARMER_MIN_TOKENS`, or config `minTokens` |
-| Cold-send guard | `warn` | config `guard`: `warn` or `refuse` |
+| Cold-send guard (what happens when you type into a cold cache) | `warn` | config `guard`: `warn` or `refuse` |
 | First active hour | 6 | env `BUN_WARMER_ACTIVE_START` (0-23) |
 | First quiet hour | 23 | env `BUN_WARMER_ACTIVE_END` (0-23, exclusive) |
 | Quiet hours | on | env `BUN_WARMER_QUIET_HOURS=off` pings around the clock, still inside the window |
@@ -123,7 +126,7 @@ While a session has subagents, a second timer checks `$.agent.list()` every 5 mi
 
 The transcript pulse is a second signal. On each check Bun Warmer runs `python3 <plugin folder>/bin/session-pulse.py <session-id>` (no shell, 10-second timeout). The script reads the tail of the session's transcript files and reports how long each subagent's transcript has been idle. A subagent is flagged only when both the events and the transcript say it has been quiet longer than the threshold. If the pulse is not available, events decide alone and the state file records why. See [`bin/README-session-pulse.md`](bin/README-session-pulse.md) for the script's output.
 
-Each stall is reported once. Bun Warmer adds it to the state file and the status line, and sends one message to the main conversation through `$.prompt.submit`. The message is fixed text plus a sanitized agent id, an allowlisted agent type, the minutes silent and the local time. It tells the model to check the agent in its own Agent list and not to stop or respawn it on this notice alone. The agent's free-text description is never put in the message, because it can contain instructions. Pulse output is treated as untrusted: only numbers and booleans from it are used.
+Each stall is reported once. Bun Warmer adds it to the state file and the status line, and sends one message to the main conversation through `$.prompt.submit`. The message is fixed text plus a sanitized agent id, an allowlisted agent type, the minutes silent and the local time. It tells the model to check the agent in its own Agent list and not to stop or respawn it on this notice alone. The agent's free-text description is never put in the message, because it can contain instructions. Pulse output is treated as untrusted. Its string ids are used only to match the agent ids the engine reports and are never shown; its numbers and booleans drive the stall decision.
 
 The message is sent only while the main conversation is idle. While a main turn is running, the message waits until that turn ends. The watchdog never stops or kills anything.
 
@@ -182,7 +185,8 @@ If a write fails, the old file is kept and `<session-id>.error.json` is written 
 - A ping's events carry no marker. While a ping is in flight, a main-conversation event with no agent id is taken for the ping's and ignored. The next event after the ping counts.
 - A subagent that streams for a long time inside one model step, with no tool call, can look quiet to the watchdog.
 - The transcript layout the pulse reads is not a public Claude Code contract and may change. Idle times come from the wall clock, so they jump after the machine sleeps.
-- The match between the ids `$.agent.list()` gives and the transcript file names has not been checked in a live session. When the match is ambiguous, events alone decide.
+- The transcript pulse finds a subagent by matching the id `$.agent.list()` gives to a transcript file name. If your Claude Code version names the files differently, or the match is ambiguous, the pulse cannot confirm or clear a stall for that subagent. Events alone then decide, so a subagent that is still writing to its transcript can be flagged as stalled.
+- If `$.agent.list()` is unavailable or fails, the stall check for that pass is skipped and nothing is flagged, and a running subagent does not extend the window when it ends.
 - Quiet hours follow the time zone of the process running the mod. A host that runs mods in a different zone would shift the hours.
 - There is no API call to close a session, so Bun Warmer never closes one.
 - Workflow agents do not appear in `$.agent.list()` or in the transcript layout, so the watchdog cannot see them.
