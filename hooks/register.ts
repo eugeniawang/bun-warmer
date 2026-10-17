@@ -374,8 +374,10 @@ function status($: EngineInterface, now: number) {
   s.statusText = d.text
   s.statusState = d.state
   s.nextPingAt = d.pingAt
-  if (d.alert === shownAlert) return
-  shownAlert = d.alert
+  // Minute counts (a stall's "23m") change on their own; only a new or cleared alert is worth a line.
+  const key = d.alert.replace(/ \d+m\b/g, '')
+  if (key === shownAlert) return
+  shownAlert = key
   return $.ui.status(d.alert ? (s.armed ? d.text : d.alert) : undefined)
 }
 
