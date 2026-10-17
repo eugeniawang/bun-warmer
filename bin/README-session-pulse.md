@@ -6,7 +6,7 @@ Usage: `session-pulse.py <session-id> [--projects-dir ~/.claude/projects] [--pre
 
 Exit 0 always except bad arguments (exit 2, including a session id with path separators or odd characters). When it cannot tell, it prints `{"available": false, "reason": ...}`. It never reports "quiet"; it reports idle seconds and the caller decides.
 
-## Layout observed on disk (Confirmed against a real session, 2026-10-14)
+## Layout observed on disk
 
 - Main transcript: `<projects-dir>/<encoded-cwd>/<session-id>.jsonl`
 - Subagents: `<projects-dir>/<encoded-cwd>/<session-id>/subagents/agent-<id>.jsonl`, with `agent-<id>.meta.json` beside each (keys seen: agentType, description, toolUseId, spawnDepth, requestShape, requestNonInteractive, model).
@@ -26,7 +26,7 @@ lastLineKind values: tool_use, tool_result, assistant_text, assistant_thinking, 
 
 - Reads at most the last 64 KB of each file. A partial last line (write in progress) is dropped; the previous complete line sets `lastLineKind`. A line over 64 KB yields `unknown`.
 - Growth: only against a snapshot passed with `--previous` (a prior output of this script). No snapshot, wrong session, or unreadable snapshot gives `grewSincePrevious: null`, never false. A file absent from the snapshot counts as grown; a file that shrank gives null.
-- Symlinks resolving outside the projects dir are ignored. A file that vanishes mid-read becomes an agent entry with `error`, not a crash.
+- Symlinks resolving outside the projects dir are ignored. A subagent file that vanishes mid-read becomes an agent entry with `error`, not a crash. If the main transcript itself vanishes or cannot be read, the script prints `{"available": false, "reason": "main transcript unreadable: <ErrorType>", ...}` (the pulse is unavailable) rather than an entry.
 
 ## Known limits
 

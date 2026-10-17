@@ -32,6 +32,8 @@ type State = {
   armedAt: number
   windowStartAt: number
   lastPingAt: number
+  /** When the last ping that found the cache warm went out. 0 when none. A failed ping refreshes nothing, so it never sets this. */
+  lastWarmPingAt: number
   lastActivityAt: number
   expiresAt: number
   refusals: number
@@ -180,7 +182,7 @@ export function bounded(name: string, value: unknown, min: number, max: number, 
 
 export function freshState(): State {
   return {
-    sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
+    sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastWarmPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
     lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
@@ -315,18 +317,41 @@ function persist($: EngineInterface) {
   return writes
 }
 
+/** The last moment the prompt cache is known to have been refreshed: session activity or a ping that found it warm. The status line and the cold-send guard both judge warm or cold from this. */
+function lastWarmAt(st: State): number {
+  return Math.max(st.lastActivityAt, st.lastWarmPingAt)
+}
+
+/**
+ * When the scheduler may send the next ping, or 0 when it may not. Spacing counts every attempt (lastPingAt), so a failed ping
+ * is not retried sooner than one interval; warm or cold counts only lastWarmAt, so no ping, retry or not, goes out once the cache is cold.
+ */
+function nextPingAt(st: State): number {
+  const base = Math.max(st.lastActivityAt, st.lastPingAt)
+  const warmAt = lastWarmAt(st)
+  if (!base || !warmAt) return 0
+  const at = Math.max(base + st.intervalMs, st.notBefore)
+  return at < warmAt + COLD_AFTER_MS ? at : 0
+}
+
 function status($: EngineInterface, now: number) {
   const dur = durabilityNote ? ` · ${durabilityNote}` : ''
   if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3) || undefined)
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
+  // Warm or cold is the cache's state (lastWarmAt); "ping in" is nextPingAt, the same answer the scheduler acts on.
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
+  const warmAt = lastWarmAt(s)
+  const cold = !warmAt || now - warmAt >= COLD_AFTER_MS
+  const state = !warmAt ? 'idle' : cold ? 'cold' : 'warm'
+  const pingAt = nextPingAt(s)
   const next = !base ? 'waiting for the first turn'
     : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
-    : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity'
+    : cold ? 'cache cold, waiting for activity'
     : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
-    : `ping in ${fmtDur(Math.max(base + s.intervalMs, s.notBefore) - now)}`
-  return $.ui.status(`bun-warmer ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
+    : !pingAt ? `no ping before the cache goes cold in ${fmtDur(warmAt + COLD_AFTER_MS - now)}`
+    : `ping in ${fmtDur(pingAt - now)}`
+  return $.ui.status(`bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
 }
 
 function stallText(): string {
@@ -342,11 +367,12 @@ function cancel() {
 function schedule($: EngineInterface, now: number) {
   cancel()
   if (!s.armed) return
-  const base = Math.max(s.lastActivityAt, s.lastPingAt)
-  const coldAt = base ? base + COLD_AFTER_MS : 0
-  // A cold cache is not pinged: that would pay the full rewrite. Only expiry is watched until activity returns.
+  const warmAt = lastWarmAt(s)
+  const coldAt = warmAt ? warmAt + COLD_AFTER_MS : 0
+  // A cold cache is not pinged: that would pay the full rewrite. A ping that would land at or after coldAt (a failed ping's
+  // retry, or one pushed back by quiet hours) is not scheduled; the timer wakes at coldAt so the status line turns cold, then only expiry is watched until activity returns.
   // A ping skipped for quiet hours leaves notBefore: the next one waits for active hours or the normal interval, whichever is later.
-  const pingAt = base && now < coldAt ? Math.max(base + s.intervalMs, s.notBefore) : s.expiresAt
+  const pingAt = nextPingAt(s) || (now < coldAt ? coldAt : s.expiresAt)
   const due = Math.min(pingAt, s.expiresAt)
   timer = $.clock.after(Math.max(1000, due - now), () => { tick($).catch(err => safeLog($, `tick failed (${errText(err)})`)) })
 }
@@ -643,8 +669,10 @@ async function tick($: EngineInterface) {
     schedule($, now)
     return
   }
+  // Spacing counts every attempt; warm or cold counts only activity and good pings (lastWarmAt), so a failed ping never earns a retry into a cold cache.
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
-  if (!base || now - base >= COLD_AFTER_MS || now - base < s.intervalMs - 1000) {
+  const warmAt = lastWarmAt(s)
+  if (!base || !warmAt || now - warmAt >= COLD_AFTER_MS || now - base < s.intervalMs - 1000) {
     schedule($, now)
     return status($, now)
   }
@@ -707,6 +735,7 @@ async function ping($: EngineInterface, now: number) {
   s.lastPing = result
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
+  if (result.ok) s.lastWarmPingAt = now
   s.notBefore = 0
   if (!result.ok) s.refusals++
   schedule($, now)
@@ -790,7 +819,9 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     stopStall()
     await disarm($, e.reason === 'clear' ? 'cleared' : 'session ended')
-    // /clear and resume continue the process under another id with no session.start; start clean, take the new id on the next event.
+    // /clear and an in-process resume go on under another id. The plugin session.start fires once per process and never for /clear
+    // (SessionStartInput has no source); the classic SessionStart hook's source 'resume' (SessionStartHookInput) is a different surface.
+    // Whether a session.start follows or not, start clean here and take the new id on the next event (ensureSession).
     resetSession()
     s.sid = ''
     return next(e)
@@ -833,12 +864,15 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const now = await $.clock.now()
-    const cold = s.lastActivityAt > 0 && now - s.lastActivityAt >= COLD_AFTER_MS
+    // The cold period is named by the moment the cache was last refreshed, so a successful ping after the last activity keeps it warm.
+    const warmAt = lastWarmAt(s)
+    const cold = warmAt > 0 && now - warmAt >= COLD_AFTER_MS
     const typed = typeof e.text === 'string' && !e.text.trimStart().startsWith('/')
     if (typed && cold && s.ctx >= s.minTokens) {
-      const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - s.lastActivityAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`
-      if (s.guard === 'refuse' && s.ackedAt !== s.lastActivityAt) {
-        s.ackedAt = s.lastActivityAt
+      const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - warmAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`
+      // One drop per cold period: the resend finds ackedAt equal to the same warmAt and passes; activity or a warm ping starts a new period with a new warmAt.
+      if (s.guard === 'refuse' && s.ackedAt !== warmAt) {
+        s.ackedAt = warmAt
         s.guardDrops++
         await persist($)
         return { drop: `${msg} Send it again to pay it.` }
