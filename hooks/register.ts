@@ -39,6 +39,10 @@ type State = {
   refusals: number
   guardDrops: number
   lastPing: PingResult | null
+  /** The full status text as last rendered, its state word (off, idle, warm, cold) and the next ping moment (0 when none). Kept for the state file; the UI is not told. */
+  statusText: string
+  statusState: string
+  nextPingAt: number
   ctx: number
   intervalMs: number
   windowMs: number
@@ -97,6 +101,8 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
       at: isoLocal(s.lastPing.at), atEpoch: epoch(s.lastPing.at), ok: s.lastPing.ok, reason: s.lastPing.reason,
       cacheReadTokens: s.lastPing.read, cacheWriteTokens: s.lastPing.write,
     },
+    statusText: s.statusText, statusState: s.statusState,
+    nextPingAt: isoLocal(s.nextPingAt), nextPingAtEpoch: epoch(s.nextPingAt),
     intervalMin: s.intervalMs / MIN,
     windowMin: s.windowMs / MIN,
     windowHours: s.windowMs / HOUR,
@@ -183,7 +189,7 @@ export function bounded(name: string, value: unknown, min: number, max: number, 
 export function freshState(): State {
   return {
     sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastWarmPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
-    lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
+    lastPing: null, statusText: '', statusState: 'off', nextPingAt: 0, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
   }
@@ -241,6 +247,7 @@ function resetSession() {
   errorFileWritten = false
   inFlight.clear()
   durabilityNote = null
+  shownAlert = ''
 }
 
 /** /clear fires session.end but no session.start; every event handler calls this so the id is always the live one. */
@@ -334,9 +341,13 @@ function nextPingAt(st: State): number {
   return at < warmAt + COLD_AFTER_MS ? at : 0
 }
 
-function status($: EngineInterface, now: number) {
+/** What the status line would say right now, split into the routine part and the alert part (off, failed ping, stall, durability). */
+function describe(now: number): { text: string; alert: string; state: string; pingAt: number } {
   const dur = durabilityNote ? ` · ${durabilityNote}` : ''
-  if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3) || undefined)
+  if (!s.armed) {
+    const text = s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3)
+    return { text, alert: text, state: 'off', pingAt: 0 }
+  }
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
   // Warm or cold is the cache's state (lastWarmAt); "ping in" is nextPingAt, the same answer the scheduler acts on.
@@ -351,7 +362,23 @@ function status($: EngineInterface, now: number) {
     : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
     : !pingAt ? `no ping before the cache goes cold in ${fmtDur(warmAt + COLD_AFTER_MS - now)}`
     : `ping in ${fmtDur(pingAt - now)}`
-  return $.ui.status(`bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`)
+  return { text: `bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`, alert: `${fail}${stall}${dur}`, state, pingAt }
+}
+
+/** The last alert shown. The UI status (and, in Remote Control, the transcript) is touched only when this changes, never for countdown ticks. */
+let shownAlert = ''
+
+/** Routine status lives in the state file (statusText) for the real status line to read. The UI is told only about alerts: off, a failed ping, a stalled subagent, a write failure. */
+function status($: EngineInterface, now: number) {
+  const d = describe(now)
+  s.statusText = d.text
+  s.statusState = d.state
+  s.nextPingAt = d.pingAt
+  // Minute counts (a stall's "23m") change on their own; only a new or cleared alert is worth a line.
+  const key = d.alert.replace(/ \d+m\b/g, '')
+  if (key === shownAlert) return
+  shownAlert = key
+  return $.ui.status(d.alert ? (s.armed ? d.text : d.alert) : undefined)
 }
 
 function stallText(): string {
@@ -674,7 +701,9 @@ async function tick($: EngineInterface) {
   const warmAt = lastWarmAt(s)
   if (!base || !warmAt || now - warmAt >= COLD_AFTER_MS || now - base < s.intervalMs - 1000) {
     schedule($, now)
-    return status($, now)
+    status($, now)
+    await persist($)
+    return
   }
   if (s.ctx < s.minTokens) {
     // A small or not-yet-measured context is not worth keeping warm: no ping, and no retry sooner than one interval.
