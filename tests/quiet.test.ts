@@ -23,7 +23,7 @@ function world(on: On, clock: Clock, env: Record<string, string> = {}) {
   const status: Array<string | undefined> = []
   let sid = 'S1'
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
-  on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
+  on('fs.write', ($, e) => { try { const t = JSON.parse(e.text).statusText; if (t && e.path.endsWith('.tmp')) status.push(t) } catch { /* not the state file */ } files.set(e.path, e.text); return { value: undefined } })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv
     if (cmd === 'mv') { finals.set(to, files.get(from) ?? ''); files.delete(from) }

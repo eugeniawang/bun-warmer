@@ -29,6 +29,7 @@ function world(on: On, forkAnswers: ForkAnswer[] = [], env: Record<string, strin
   on('fs.write', ($, e) => {
     if (fail.write && e.path.endsWith('.tmp')) throw new Error('disk full')
     if (fail.errWrite && e.path.endsWith('.error.json')) throw new Error('disk full')
+    try { const t = JSON.parse(e.text).statusText; if (t && e.path.endsWith('.tmp')) status.push(t) } catch { /* not the state file */ } 
     files.set(e.path, e.text); return { value: undefined }
   })
   on('process.run', ($, e) => {

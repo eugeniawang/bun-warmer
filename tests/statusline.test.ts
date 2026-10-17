@@ -8,8 +8,9 @@ const at = (y: number, mo: number, d: number, h: number, mi = 0) => new Date(y, 
 
 function world(on: On, env: Record<string, string> = {}) {
   const status: Array<string | undefined> = []
+  const uiCalls: Array<string | undefined> = []
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] }))
-  on('fs.write', () => ({ value: undefined }))
+  on('fs.write', ($, e) => { try { const t = JSON.parse(e.text).statusText; if (t && e.path.endsWith('.tmp')) status.push(t) } catch { /* not the state file */ } return { value: undefined } })
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
@@ -17,12 +18,12 @@ function world(on: On, env: Record<string, string> = {}) {
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1000000, tokens: 200000 }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] as never }))
-  on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
+  on('ui.status', ($, e) => { uiCalls.push(e.text); return { value: undefined } })
   on('ui.log', () => ({ value: undefined }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('model.fork', async () => ({ value: { isAnswered: true, text: 'warm', usage: { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 200000, cache_creation_input_tokens: 10 } } as never }))
-  return { status }
+  return { status, uiCalls }
 }
 
 const start = { surface: null, isInteractive: false, cwd: '/work' } as const
@@ -72,5 +73,18 @@ describe('status line: state, time left, next ping', () => {
     await clock.advance(51 * MIN) // 23:21: the 23:20 ping was due in quiet hours and skipped
     expect(w.status.at(-1)).toMatch(/^bun-warmer · warm · 2h10m left · quiet hours, pings resume 06:00$/)
     expect(w.status.at(-1)).not.toContain('\n')
+  })
+})
+
+describe('routine activity never touches the UI', () => {
+  test('turns, pings and countdown ticks call ui.status zero times; the text lives in the state file', async ($, on) => {
+    const clock = mock.clock(on, { now: at(2026, 10, 14, 10) })
+        const w = world(on)
+    w.status.length = 0
+    await $.session.start(start)
+    for (let i = 0; i < 5; i++) await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.uiCalls).toEqual([])
+    expect(w.status.at(-1)).toMatch(/^bun-warmer · warm · /)
   })
 })
