@@ -229,8 +229,8 @@ describe('numeric settings are clamped', () => {
   const targets: Array<[string, (st: Record<string, any>) => unknown, unknown]> = [
     ['BUN_WARMER_MAX_HOURS', st => st.maxHours, 12],
     ['BUN_WARMER_INTERVAL_MIN', st => st.intervalMin, 50],
-    ['BUN_WARMER_WINDOW_MIN', st => st.windowMin, 90],
-    ['BUN_WARMER_WINDOW_HOURS', st => st.windowMin, 90],
+    ['BUN_WARMER_WINDOW_MIN', st => st.windowMin, 180],
+    ['BUN_WARMER_WINDOW_HOURS', st => st.windowMin, 180],
     ['BUN_WARMER_STALL_MIN', st => st.stallMin, 20],
     ['BUN_WARMER_STALL_CHECK_MIN', st => st.stallCheckMin, 5],
   ]
