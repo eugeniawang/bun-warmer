@@ -168,6 +168,49 @@ describe('bun-warmer', () => {
     expect(w.status.at(-1)).toMatch(/FAILED/)
   })
 
+  test('a failed ping at +50m is not retried at +100m: the cache went cold at +60m, and the status line says so', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [], { BUN_WARMER_WINDOW_HOURS: '3' }) // every ping fails
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.state().lastPing.ok).toBe(false)
+    expect(w.status.at(-1)).toMatch(/ · warm · .* · no ping before the cache goes cold in 10m/) // rendered by the ping at +50m
+    await clock.advance(10 * MIN) // +61m: cold
+    expect(w.status.at(-1)).toMatch(/^bun-warmer · cold · .* · cache cold, waiting for activity/)
+    await clock.advance(50 * MIN) // +111m: past the +100m retry
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/ · cold · .* · cache cold, waiting for activity/)
+  })
+
+  test('a successful ping at +50m keeps the cache warm, so the next ping goes out at +100m', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm], { BUN_WARMER_WINDOW_HOURS: '3' })
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/ · warm · .* · ping in 50m/) // rendered by the ping at +50m
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.state().lastPing.ok).toBe(true)
+  })
+
+  test('activity after a cold period re-arms pinging', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [{ isAnswered: false, reason: 'api-error', status: 529 } as never, warm], { BUN_WARMER_WINDOW_HOURS: '3' })
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(111 * MIN) // ping at +50m fails, no retry at +100m: cold
+    expect(w.forks.length).toBe(1)
+    await $.turn.complete(answer()) // activity at +111m
+    expect(w.status.at(-1)).toMatch(/ · warm · .* · ping in 50m/)
+    await clock.advance(51 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.state().lastPing.ok).toBe(true)
+  })
+
   test('a ping that finds the cache gone is recorded as failed', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [{ read: 0, write: 200000 }])
