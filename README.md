@@ -63,8 +63,8 @@ bun-warmer · cold · 20m left · cache cold, waiting for activity
 ```
 
 - `idle` means no turn has happened yet.
-- `warm` means there was activity or a ping in the last 60 minutes.
-- `cold` means 60 minutes have passed with no activity or ping.
+- `warm` means there was activity or a successful ping in the last 60 minutes.
+- `cold` means 60 minutes have passed with no activity or successful ping.
 
 The last part can also read `quiet hours, pings resume 06:00`, `context under 50,000 tokens, not pinging`, or `context size unknown, not pinging`. A failed ping adds `last ping FAILED: <reason>`, and a silent subagent adds `STALLED: <id> <N>m`. When the mod is off, the line reads `bun-warmer off: <reason>`.
 
@@ -118,16 +118,19 @@ Quiet hours use the local time of the machine Claude Code runs on, including day
 
 ### `/clear`, resume and compaction
 
-`/clear` and resume both reset everything Bun Warmer knows about the old session, and a ping that was in flight when that happened is discarded. They differ in what comes next:
+`/clear` and an in-process resume both reset everything Bun Warmer knows about the old session, and a ping that was in flight when that happened is discarded. They differ in what comes next:
 
 - `/clear` leaves the old session's state file with `armed: false` and `note: "cleared"`. The mod stays off until you type a prompt, which arms a new window under the new session id.
-- Resume ends the old session like any other non-`/clear` end: its state file is left with `armed: false` and `note: "session ended"`. The resumed session's `session.start` then arms a new window right away, without waiting for a prompt. Compaction clears the remembered context size until the next response, so the guard never acts on the old count.
+- An in-process `/resume` (typed inside a running Claude Code) does not fire the plugin's `session.start`, because that hook fires once per process. The old state file is left with `armed: false`, and the mod stays off until you type a prompt, which arms a new window under the resumed session id.
+- Starting a new process with `claude --resume` (or `claude --continue`) does fire `session.start`, so the mod arms right away, without waiting for a prompt. The old session's state file is left with `armed: false` and `note: "session ended"`.
+
+Compaction clears the remembered context size until the next response, so the guard never acts on the old count.
 
 ### Stall watchdog
 
 While a session has subagents, a second timer checks `$.agent.list()` every 5 minutes. This call is local and costs no tokens. A `running` subagent that has produced no events and has no tool call in flight for 20 minutes is flagged as stalled. A tool call that is still running counts as activity for as long as it runs.
 
-The transcript pulse is a second signal. On each check Bun Warmer runs `python3 <plugin folder>/bin/session-pulse.py <session-id>` (no shell, 10-second timeout). The script reads the tail of the session's transcript files and reports how long each subagent's transcript has been idle. A subagent is flagged only when both the events and the transcript say it has been quiet longer than the threshold. If the pulse is not available, events decide alone and the state file records why. See [`bin/README-session-pulse.md`](bin/README-session-pulse.md) for the script's output.
+The transcript pulse is a second signal. On each check that finds at least one subagent with status `running`, Bun Warmer runs `python3 <plugin folder>/bin/session-pulse.py <session-id>` (no shell, 10-second timeout). The script reads the tail of the session's transcript files and reports how long each subagent's transcript has been idle. A subagent is flagged only when both the events and the transcript say it has been quiet longer than the threshold. If the pulse is not available, events decide alone and the state file records why. `script-missing` is recorded only after such a check, so it does not appear while no subagent is running. See [`bin/README-session-pulse.md`](bin/README-session-pulse.md) for the script's output.
 
 Each stall is reported once. Bun Warmer adds it to the state file and the status line, and sends one message to the main conversation through `$.prompt.submit`. The message is fixed text plus a sanitized agent id, an allowlisted agent type, the minutes silent and the local time. It tells the model to check the agent in its own Agent list and not to stop or respawn it on this notice alone. The agent's free-text description is never put in the message, because it can contain instructions. Pulse output is treated as untrusted. Its string ids are used only to match the agent ids the engine reports and are never shown; its numbers and booleans drive the stall decision.
 
