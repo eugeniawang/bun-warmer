@@ -1,4 +1,5 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
+import { pluginPulseCandidate } from '../hooks/register'
 import type { ModelForkResult, On, PromptOrigin, TurnCompleteInput, TurnStepInput } from 'claude-code'
 
 tier('user')
@@ -184,6 +185,32 @@ describe('BUN_WARMER_PULSE must be an absolute .py path', () => {
       expect(w.state().configWarnings.join(' ')).toMatch(/BUN_WARMER_PULSE ignored/)
     })
   }
+})
+
+describe('the plugin root must be absolute', () => {
+  for (const rel of ['.', './plugin', 'plugin', '../x']) {
+    test(`relative root ${rel} gives no candidate (so it is never test -f'd or run) and a warning`, () => {
+      const r = pluginPulseCandidate(rel)
+      expect(r.path).toBeNull()
+      expect(r.warning).toMatch(/Plugin root ignored/)
+    })
+  }
+  test('a trailing-slash root gives the exact path', () => {
+    expect(pluginPulseCandidate('/opt/p//').path).toBe('/opt/p/bin/session-pulse.py')
+    expect(pluginPulseCandidate('/opt/p').path).toBe('/opt/p/bin/session-pulse.py')
+  })
+  test('no root: no candidate, no warning', () => {
+    expect(pluginPulseCandidate(undefined)).toEqual({ path: null, warning: null })
+  })
+  test('the real run still tests and runs the absolute plugin-root script, with no warning', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, { pulse: pulseOf(5) })
+    await $.session.start(start)
+    w.setAgents([sub()])
+    await clock.advance(5 * MIN)
+    expect(w.tested[0]).toBe(PULSE_PATH)
+    expect(w.state().configWarnings.join(' ')).not.toMatch(/Plugin root ignored/)
+  })
 })
 
 describe('numeric settings are clamped', () => {
