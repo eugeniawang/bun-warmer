@@ -32,6 +32,8 @@ type State = {
   armedAt: number
   windowStartAt: number
   lastPingAt: number
+  /** When the last ping that found the cache warm went out. 0 when none. A failed ping refreshes nothing, so it never sets this. */
+  lastWarmPingAt: number
   lastActivityAt: number
   expiresAt: number
   refusals: number
@@ -180,7 +182,7 @@ export function bounded(name: string, value: unknown, min: number, max: number, 
 
 export function freshState(): State {
   return {
-    sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
+    sid: '', armed: false, armedAt: 0, windowStartAt: 0, lastPingAt: 0, lastWarmPingAt: 0, lastActivityAt: 0, expiresAt: 0, refusals: 0, guardDrops: 0,
     lastPing: null, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
@@ -315,13 +317,20 @@ function persist($: EngineInterface) {
   return writes
 }
 
+/** The last moment the prompt cache is known to have been refreshed: session activity or a ping that found it warm. The status line and the cold-send guard both judge warm or cold from this. */
+function lastWarmAt(st: State): number {
+  return Math.max(st.lastActivityAt, st.lastWarmPingAt)
+}
+
 function status($: EngineInterface, now: number) {
   const dur = durabilityNote ? ` · ${durabilityNote}` : ''
   if (!s.armed) return $.ui.status(s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3) || undefined)
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
+  // Warm or cold is the cache's state (lastWarmAt); when the next ping goes out follows the scheduler, which spaces retries after a failed ping too.
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
-  const state = !base ? 'idle' : now - base >= COLD_AFTER_MS ? 'cold' : 'warm'
+  const warmAt = lastWarmAt(s)
+  const state = !warmAt ? 'idle' : now - warmAt >= COLD_AFTER_MS ? 'cold' : 'warm'
   const next = !base ? 'waiting for the first turn'
     : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
     : now - base >= COLD_AFTER_MS ? 'cache cold, waiting for activity'
@@ -708,6 +717,7 @@ async function ping($: EngineInterface, now: number) {
   s.lastPing = result
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
+  if (result.ok) s.lastWarmPingAt = now
   s.notBefore = 0
   if (!result.ok) s.refusals++
   schedule($, now)
@@ -834,12 +844,15 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const now = await $.clock.now()
-    const cold = s.lastActivityAt > 0 && now - s.lastActivityAt >= COLD_AFTER_MS
+    // The cold period is named by the moment the cache was last refreshed, so a successful ping after the last activity keeps it warm.
+    const warmAt = lastWarmAt(s)
+    const cold = warmAt > 0 && now - warmAt >= COLD_AFTER_MS
     const typed = typeof e.text === 'string' && !e.text.trimStart().startsWith('/')
     if (typed && cold && s.ctx >= s.minTokens) {
-      const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - s.lastActivityAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`
-      if (s.guard === 'refuse' && s.ackedAt !== s.lastActivityAt) {
-        s.ackedAt = s.lastActivityAt
+      const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - warmAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`
+      // One drop per cold period: the resend finds ackedAt equal to the same warmAt and passes; activity or a warm ping starts a new period with a new warmAt.
+      if (s.guard === 'refuse' && s.ackedAt !== warmAt) {
+        s.ackedAt = warmAt
         s.guardDrops++
         await persist($)
         return { drop: `${msg} Send it again to pay it.` }

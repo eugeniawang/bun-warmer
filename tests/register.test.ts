@@ -222,6 +222,55 @@ describe('bun-warmer', () => {
     expect((await $.prompt.submit(say('report', { kind: 'task-notification' }))).drop).toBe(undefined)
   })
 
+  test('a successful ping keeps the cache warm for the guard: activity 110m ago, ping 10m ago, no drop and no warning', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm, warm], { BUN_WARMER_WINDOW_HOURS: '3' })
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(101 * MIN) // pings at +50m and +100m, both warm
+    expect(w.forks.length).toBe(2)
+    expect(w.state().lastPing.ok).toBe(true)
+    await clock.advance(9 * MIN) // activity 110m ago, last successful ping 10m ago
+    expect(w.status.at(-1)).toMatch(/ · warm · /)
+    const r = await $.prompt.submit(say('hello', composer))
+    expect(r.drop).toBe(undefined)
+    expect(w.logs.some(l => /went cold/.test(l))).toBe(false)
+    expect(w.state().guardDrops).toBe(0)
+  })
+
+  test('a failed ping does not keep the cache warm: refuse still drops the first send, timed from the last good ping', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm], { BUN_WARMER_WINDOW_HOURS: '3' }) // +50m ping ok, +100m ping fails
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(101 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.state().lastPing.ok).toBe(false)
+    await clock.advance(10 * MIN) // activity 111m ago, failed ping 11m ago, last good ping 61m ago
+    expect((await $.prompt.submit(say('hello', composer))).drop).toMatch(/went cold 1m ago.*Send it again/)
+    expect((await $.prompt.submit(say('hello', composer))).drop).toBe(undefined)
+    expect(w.state().guardDrops).toBe(1)
+  })
+
+  test('activity and the last good ping both over 60m ago: cold, refuse drops once, a later cold period re-arms', { options: { guard: 'refuse' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm]) // default 90m window: one ping at +50m, then the window expires
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await clock.advance(51 * MIN)
+    expect(w.state().lastPing.ok).toBe(true)
+    await clock.advance(70 * MIN) // activity 121m ago, ping 71m ago
+    expect(w.state().armed).toBe(false)
+    expect((await $.prompt.submit(say('hello', composer))).drop).toMatch(/went cold 11m ago/)
+    expect((await $.prompt.submit(say('hello', composer))).drop).toBe(undefined)
+    expect(w.state().guardDrops).toBe(1)
+    // The resend was activity and re-armed the mod; its next ping fails (no warm answer left), so the cache goes cold again and the guard drops again, once.
+    await clock.advance(61 * MIN)
+    expect(w.state().lastPing.ok).toBe(false)
+    expect((await $.prompt.submit(say('again', composer))).drop).toMatch(/Send it again/)
+    expect((await $.prompt.submit(say('again', composer))).drop).toBe(undefined)
+  })
+
   test('/clear resets the session: new id, no stale context, old file left disarmed', { options: { guard: 'refuse' } }, async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])

@@ -110,7 +110,7 @@ Subagent turns count as activity. When the window ends while a subagent is still
 
 ### Cold-send guard
 
-When you type a prompt into a session whose cache has gone cold, the guard notes how many tokens the send will re-write. In the default `warn` mode it only logs that note. In `refuse` mode it drops your first send once with that note; send again to go ahead. The guard only looks at prompts a person typed (origins `composer` and `bridge`). Subagent returns, task notifications, scheduled prompts, SDK and plugin messages always pass through. Bun Warmer does not know model prices, so it shows tokens, not dollars.
+The cache counts as warm when there was activity or a successful ping within the last 60 minutes; a failed ping does not count. When you type a prompt into a session whose cache has gone cold, the guard notes how many tokens the send will re-write. In the default `warn` mode it only logs that note. In `refuse` mode it drops your first send once with that note; send again to go ahead. It drops only once per cold period: after the next activity or successful ping, a later cold period is guarded again. The guard only looks at prompts a person typed (origins `composer` and `bridge`). Subagent returns, task notifications, scheduled prompts, SDK and plugin messages always pass through. Bun Warmer does not know model prices, so it shows tokens, not dollars.
 
 ### Quiet hours
 
@@ -118,7 +118,10 @@ Quiet hours use the local time of the machine Claude Code runs on, including day
 
 ### `/clear`, resume and compaction
 
-`/clear` and resume reset everything Bun Warmer knows about the old session. The old session's state file is left with `armed: false` and `note: "cleared"`, and the mod stays off until you type a prompt. A ping that was in flight when that happened is discarded. Compaction clears the remembered context size until the next response, so the guard never acts on the old count.
+`/clear` and resume both reset everything Bun Warmer knows about the old session, and a ping that was in flight when that happened is discarded. They differ in what comes next:
+
+- `/clear` leaves the old session's state file with `armed: false` and `note: "cleared"`. The mod stays off until you type a prompt, which arms a new window under the new session id.
+- Resume ends the old session like any other non-`/clear` end: its state file is left with `armed: false` and `note: "session ended"`. The resumed session's `session.start` then arms a new window right away, without waiting for a prompt. Compaction clears the remembered context size until the next response, so the guard never acts on the old count.
 
 ### Stall watchdog
 
