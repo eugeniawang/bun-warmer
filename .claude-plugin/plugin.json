@@ -15,8 +15,8 @@
     "windowMin": {
       "type": "number",
       "title": "Window (minutes)",
-      "description": "How long pings continue after the last human prompt. Default 90. Env BUN_WARMER_WINDOW_MIN overrides; env BUN_WARMER_WINDOW_HOURS (if set) overrides both.",
-      "default": 90
+      "description": "How long pings continue after the last human prompt. Default 180. Env BUN_WARMER_WINDOW_MIN overrides; env BUN_WARMER_WINDOW_HOURS (if set) overrides both.",
+      "default": 180
     },
     "minTokens": {
       "type": "number",

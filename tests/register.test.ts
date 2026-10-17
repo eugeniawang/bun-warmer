@@ -135,7 +135,7 @@ describe('bun-warmer', () => {
     expect(st.sessionId).toBe('S1')
     expect(st.armedAtEpoch).toBe(Math.floor(START / 1000))
     expect(st.lastPingAtEpoch).toBe(Math.floor((START + 50 * MIN) / 1000))
-    expect(st.expiresAtEpoch).toBe(Math.floor((START + 90 * MIN) / 1000)) // the default window is 90 minutes
+    expect(st.expiresAtEpoch).toBe(Math.floor((START + 180 * MIN) / 1000)) // the default window is 180 minutes
     for (const k of ['armedAt', 'lastPingAt', 'lastActivityAt', 'expiresAt']) expect(st[k]).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$/)
     expect(st.refusals).toBe(0)
   })
@@ -296,9 +296,9 @@ describe('bun-warmer', () => {
     expect(w.state().guardDrops).toBe(1)
   })
 
-  test('activity and the last good ping both over 60m ago: cold, refuse drops once, a later cold period re-arms', { options: { guard: 'refuse' } }, async ($, on) => {
+  test('activity and the last good ping both over 60m ago: cold, refuse drops once, a later cold period re-arms', { options: { guard: 'refuse', windowMin: 90 } }, async ($, on) => {
     const clock = mock.clock(on, { now: START })
-    const w = world(on, [warm]) // default 90m window: one ping at +50m, then the window expires
+    const w = world(on, [warm]) // window pinned to 90m: one ping at +50m, then the window expires
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(51 * MIN)

@@ -1,6 +1,6 @@
 # Bun Warmer
 
-Bun Warmer is a mod for Claude Code users who take breaks during long sessions. Claude Code caches your conversation for 60 minutes. After a longer break, your next message re-writes the whole context at the cache-write rate, which is slow and costly. Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 90 minutes after your last prompt. It also flags subagents that go silent.
+Bun Warmer is a mod for Claude Code users who take breaks during long sessions. Claude Code caches your conversation for 60 minutes. After a longer break, your next message re-writes the whole context at the cache-write rate, which is slow and costly. Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 3 hours after your last prompt. It also flags subagents that go silent.
 
 Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal (MIT). Bun Warmer is written from scratch; none of its code is copied.
 
@@ -75,7 +75,7 @@ An environment variable beats the matching config menu value. The config menu fi
 | Setting | Default | How to set it |
 |---|---|---|
 | Ping interval | 50 minutes, capped at 55 | env `BUN_WARMER_INTERVAL_MIN`, or config `intervalMin` |
-| Keep-warm window | 90 minutes | env `BUN_WARMER_WINDOW_HOURS` (hours), else env `BUN_WARMER_WINDOW_MIN`, else config `windowMin` |
+| Keep-warm window | 180 minutes (3 hours) | env `BUN_WARMER_WINDOW_HOURS` (hours), else env `BUN_WARMER_WINDOW_MIN`, else config `windowMin` |
 | Hard cap on window extensions | 12 hours | env `BUN_WARMER_MAX_HOURS` |
 | Minimum context to ping or warn | 50,000 tokens | env `BUN_WARMER_MIN_TOKENS`, or config `minTokens` |
 | Cold-send guard (what happens when you type into a cold cache) | `warn` | config `guard`: `warn` or `refuse` |
@@ -157,7 +157,7 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
   "lastSkippedAt": null,   "lastSkippedAtEpoch": null,
   "lastPing": { "at": "…", "atEpoch": 0, "ok": true, "reason": null, "cacheReadTokens": 0, "cacheWriteTokens": 0 },
   "intervalMin": 50,
-  "windowMin": 90, "windowHours": 1.5,
+  "windowMin": 180, "windowHours": 3,
   "minTokens": 50000, "contextTokens": 200000, "skippedSmall": 0,
   "pulse": { "available": true, "reason": null, "checkedAt": "…", "checkedAtEpoch": 0, "agentsSeen": 1 },
   "maxHours": 12,

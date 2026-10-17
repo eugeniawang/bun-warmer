@@ -35,7 +35,7 @@ describe('status line: state, time left, next ping', () => {
     mock.clock(on, { now: at(2026, 10, 14, 10) })
     const w = world(on)
     await $.session.start(start)
-    expect(w.status.at(-1)).toBe('bun-warmer · idle · 1h30m left · waiting for the first turn')
+    expect(w.status.at(-1)).toBe('bun-warmer · idle · 3h00m left · waiting for the first turn')
   })
 
   test('right after a turn: warm, window left, ping in the interval', async ($, on) => {
@@ -43,7 +43,7 @@ describe('status line: state, time left, next ping', () => {
     const w = world(on)
     await $.session.start(start)
     await $.turn.complete(answer())
-    expect(w.status.at(-1)).toBe('bun-warmer · warm · 1h30m left · ping in 50m')
+    expect(w.status.at(-1)).toBe('bun-warmer · warm · 3h00m left · ping in 50m')
   })
 
   test('after a successful ping the cache is warm again with a fresh ping countdown and less window left', async ($, on) => {
@@ -52,7 +52,7 @@ describe('status line: state, time left, next ping', () => {
     await $.session.start(start)
     await $.turn.complete(answer())
     await clock.advance(51 * MIN) // the 10:50 ping fired
-    expect(w.status.at(-1)).toBe('bun-warmer · warm · 40m left · ping in 50m')
+    expect(w.status.at(-1)).toBe('bun-warmer · warm · 2h10m left · ping in 50m')
   })
 
   test('a cache with no activity or ping for 60 minutes is cold', async ($, on) => {
