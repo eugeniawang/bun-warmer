@@ -8,7 +8,7 @@ Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal 
 
 - Claude Code with the function-hook mod (plugin) API, which is early access. The plugin does not declare a minimum version; it has been tested on Claude Code 2.1.302.
 - A POSIX host (macOS or Linux). Bun Warmer builds paths with `/` and runs `mv`, `rm` and `test`, so it does not run on Windows.
-- `python3` on your `PATH` for the transcript pulse script (`bin/session-pulse.py`, standard library only). Without it the stall watchdog still works from events alone.
+- `python3` on your `PATH` for the transcript pulse (a small script that reads the session's local transcript files to confirm a subagent is still writing; `bin/session-pulse.py`, standard library only). Without it the stall watchdog still works from events alone.
 
 ## Install
 

@@ -26,7 +26,7 @@ lastLineKind values: tool_use, tool_result, assistant_text, assistant_thinking, 
 
 - Reads at most the last 64 KB of each file. A partial last line (write in progress) is dropped; the previous complete line sets `lastLineKind`. A line over 64 KB yields `unknown`.
 - Growth: only against a snapshot passed with `--previous` (a prior output of this script). No snapshot, wrong session, or unreadable snapshot gives `grewSincePrevious: null`, never false. A file absent from the snapshot counts as grown; a file that shrank gives null.
-- Symlinks resolving outside the projects dir are ignored. A file that vanishes mid-read becomes an agent entry with `error`, not a crash.
+- Symlinks resolving outside the projects dir are ignored. A subagent file that vanishes mid-read becomes an agent entry with `error`, not a crash. If the main transcript itself vanishes or cannot be read, the script prints `{"available": false, "reason": "main transcript unreadable: <ErrorType>", ...}` (the pulse is unavailable) rather than an entry.
 
 ## Known limits
 
