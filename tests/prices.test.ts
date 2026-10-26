@@ -22,6 +22,10 @@ describe('pingUsd list prices', () => {
   test('Haiku 5.5 uses the long-prompt prices over 100,000 tokens, Haiku 4.5 keeps its own', () => {
     close(pingUsd('claude-haiku-5-5', usage(100_000)), 0.001)
     close(pingUsd('claude-haiku-5-5', usage(200_000)), 0.01)
+    // Up to 100,000 prompt tokens: write $0.20, base input $0.10, output $0.50.
+    close(pingUsd('claude-haiku-5-5', usage(0, 50_000, 50_000, 1_000_000)), 50_000 * 0.2 / 1e6 + 50_000 * 0.1 / 1e6 + 0.5)
+    // 100,001 prompt tokens: the whole request moves to write $1, base input $0.50, output $2.50.
+    close(pingUsd('claude-haiku-5-5', usage(1, 50_000, 50_000, 1_000_000)), 1 * 0.05 / 1e6 + 50_000 * 1 / 1e6 + 50_000 * 0.5 / 1e6 + 2.5)
     close(pingUsd('claude-haiku-4-5', usage(200_000)), 0.02)
   })
 

@@ -144,13 +144,13 @@ Prices below are Anthropic's API list prices per million tokens (MTok) from the 
 
 A Claude Opus 5.5 session holds 174,324 tokens of context (**measured**: the median `lastPing.cacheReadTokens` in the author's state files, below). You step away for 2 hours.
 
-Rates for Claude Opus 5.5: a 1-hour cache write is $8 / MTok, a cache read is $0.20 / MTok.
+Rates for Claude Opus 5.5 (list price): a 1-hour cache write is $8 / MTok, a cache read is $0.20 / MTok.
 
 - Without Bun Warmer, the cache goes cold at 60 minutes. Your next prompt re-writes the whole context: 174,324 × $8 / 1,000,000 = **$1.39** (calculated).
 - With Bun Warmer, it pings at 50 and 100 minutes. Each ping reads the cache: 174,324 × $0.20 / 1,000,000 = **$0.035** (calculated). Your prompt at 120 minutes reads a warm cache for another $0.035. Total: 3 × $0.035 = **$0.10** (calculated).
 - Saved on this break: $1.39 − $0.10 = **$1.29** (calculated).
 
-On Claude Opus 5.5 a re-write costs 40 times a read ($8 / $0.20), so one avoided re-write pays for 40 pings. If you never come back, the pings are spent for nothing. With the default settings that is at most 3 pings per window (at 50, 100 and 150 minutes inside 180), $0.10 in this example.
+On Claude Opus 5.5 a re-write costs 40 times a read ($8 / $0.20 = 40, calculated), so one avoided re-write pays for 40 pings. If you never come back, the pings are spent for nothing. With the default settings (a ping every 50 minutes, a 180-minute window) that is at most 3 pings, at 50, 100 and 150 minutes: 3 × $0.035 = $0.10 in this example (calculated).
 
 ### The author's own state files
 
@@ -164,16 +164,16 @@ On Claude Opus 5.5 a re-write costs 40 times a read ($8 / $0.20), so one avoided
 | Pings skipped for quiet hours | 34 | measured: sum of `skippedQuiet` |
 | Context kept warm per ping | 65,156 to 548,659 tokens, median 174,324 | measured: `lastPing.cacheReadTokens` |
 | Cost of the 35 last pings that name a model | $1.26 | calculated, below |
-| Re-writes the last pings may have avoided | up to 9 | measured, see the note below |
+| Re-writes the last pings may have avoided | up to 9 | calculated upper bound, see the note below |
 
-How the $1.26 is calculated, from `lastPing.model`, `lastPing.cacheReadTokens` and `lastPing.cacheWriteTokens`:
+How the $1.26 is calculated, from `lastPing.model`, `lastPing.cacheReadTokens`, `lastPing.cacheWriteTokens` and `lastPing.costUsd`:
 
 - 28 Claude Opus 5.5 pings: 5,396,457 tokens read × $0.20 + 7,330 tokens written × $8, per million = $1.079 + $0.059.
 - 7 Claude Sonnet 5.5 pings: 1,043,409 tokens read × $0.10 + 2,392 tokens written × $4, per million = $0.104 + $0.010.
-- The pings' own few input and output tokens add at most $0.006.
-- Total: $1.079 + $0.059 + $0.104 + $0.010 + $0.006 = $1.26 (rounded). The other 8 pings came from a version that did not record the model, so they are not priced.
+- The pings' own input and output tokens are not stored apart, but `lastPing.costUsd` includes them. The sum of `costUsd` minus its cache read and write share, at the rates it was priced with, leaves $0.0050 for the Opus pings and $0.0005 for the Sonnet pings. The old Opus row priced input and output at 1.25 times today's rates ($5 and $25 against $4 and $20), so the Opus part is $0.0050 / 1.25 = $0.0040; the Sonnet rates did not change. Together: $0.0045.
+- Total: $1.079 + $0.059 + $0.104 + $0.010 + $0.0045 = $1.26 (rounded). The other 8 pings came from a version that did not record the model, so they are not priced.
 
-Re-writes avoided: in 9 sessions, activity came within 60 minutes after the last ping (`lastActivityAtEpoch` minus `lastPing.atEpoch`), so it found a cache the ping had kept warm. A ping goes out only after 50 minutes of quiet, but the file keeps only the latest activity, not the first one after the ping. Some of that activity may have come soon enough to find the cache warm without the ping, so 9 is an upper bound. Six of the 9 were Claude Opus 5.5 sessions with 1,202,273 tokens of context between them. Re-writing that would have cost 1,202,273 × $8 / 1,000,000 = $9.62 (calculated); reading it cost $0.24 (calculated).
+Re-writes avoided (calculated from `lastActivityAtEpoch` and `lastPing.atEpoch`): in 9 sessions, activity came within 60 minutes after the last ping, so it found a cache the ping had kept warm. A ping goes out only after 50 minutes of quiet, but the file keeps only the latest activity, not the first one after the ping. Some of that activity may have come soon enough to find the cache warm without the ping, so 9 is an upper bound and the true count may be lower. Six of the 9 were Claude Opus 5.5 sessions with 1,202,273 tokens of context between them. Re-writing that would have cost 1,202,273 × $8 / 1,000,000 = $9.62 (calculated); reading it cost $0.24 (calculated).
 
 Versions before this one priced Claude Opus 5.5 and Claude Sonnet 5.5 pings at older models' rates, so their `lastPing.costUsd` reads high. The figures above are recomputed from the token counts.
 
