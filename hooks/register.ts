@@ -26,24 +26,31 @@ type PulseRecord = { available: boolean; reason: string | null; checkedAt: numbe
 
 type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null; model?: string | null; usd?: number | null }
 
-// $ per million tokens, [cache read, 1h cache write, output], list prices September 2026 (same table cache-tax uses).
+// $ per million tokens, [cache read, 1h cache write, output], Anthropic list prices October 2026.
 // Longer family names first: a model id matches the first row it contains.
 const PRICES: Array<[string, number, number, number]> = [
   ['fable-5-1', 0.25, 20, 50],
   ['fable-5', 1, 20, 50],
+  ['opus-5-5', 0.2, 8, 20],
   ['opus-5', 0.5, 10, 25],
   ['opus-4', 0.5, 10, 25],
+  ['sonnet-5-5', 0.1, 4, 10],
   ['sonnet-5', 0.2, 4, 10],
   ['sonnet', 0.3, 6, 15],
+  ['haiku-5', 0.01, 0.2, 0.5],
   ['haiku', 0.1, 2, 5],
 ]
+
+// Haiku 5.5 bills a whole request at these higher prices when its prompt (input, cache reads and cache writes) is over 100,000 tokens.
+const HAIKU_5_LONG: [number, number, number] = [0.05, 1, 2.5]
 
 /** What one ping cost: cache read at the read rate, cache write at the write rate, plain input at half the write rate, output at the output rate. Null when the model is unknown. */
 export function pingUsd(model: string | null, u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }): number | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
   const row = PRICES.find(([family]) => m.includes(family))
   if (!row) return null
-  const [read, write, output] = row.slice(1) as [number, number, number]
+  const prompt = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+  const [read, write, output] = row[0] === 'haiku-5' && prompt > 100_000 ? HAIKU_5_LONG : row.slice(1) as [number, number, number]
   return (u.cache_read_input_tokens * read + u.cache_creation_input_tokens * write + u.input_tokens * write / 2 + u.output_tokens * output) / 1e6
 }
 

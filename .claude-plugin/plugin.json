@@ -5,6 +5,7 @@
     "name": "Eugenia Wang"
   },
   "description": "Keeps the prompt cache warm with a periodic ping for sessions with a large context, counts subagent work as activity, never blocks a prompt a human did not type, flags silent subagents, and writes an informational state file. Inspired by cache-tax by Karan Bansal (MIT).",
+  "license": "MIT",
   "userConfig": {
     "intervalMin": {
       "type": "number",
