@@ -15,7 +15,7 @@ function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' |
   const sent: Array<{ text: string; origin: PromptOrigin }> = []
   let agents: Agent[] = []
   // These tests predate quiet hours and run at an arbitrary hour of the machine's day: quiet hours stay off unless a test sets them. tests/quiet.test.ts covers them.
-  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : e.name === 'BUN_WARMER_STALL_PROMPT' ? 'on' : undefined) }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv

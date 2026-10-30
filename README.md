@@ -8,9 +8,11 @@ When your main cache lasts an hour, Bun Warmer sends a small ping after 50 minut
 
 - One hooks module, `hooks/register.ts`, which Claude Code loads as a mod when you point it at this folder. Nothing is installed system-wide and no background process runs outside Claude Code.
 - One slash command, `/bunwarm` (status, on, off).
-- One state file per session in `~/.claude/bun-warmer/<session-id>.json`, rewritten as the session runs. Old files are not removed yet; you can delete them at any time.
+- One state file per session in `~/.claude/bun-warmer/<session-id>.json`, rewritten as the session runs. At each session start, Bun Warmer removes state files that say `armed: false` and are older than 30 days, plus leftover temp files older than a day (see [Cleanup](#cleanup)). You can delete any of them yourself at any time.
+- An optional status line script, `bin/statusline.py` (standard library only). It does nothing until you add it to your status line (see [Status line](#status-line)).
 - A Python script, `bin/session-pulse.py` (standard library only), which the mod runs with `python3` while subagents are running, to read the session's local transcript files and check they are still being written.
 - Pings. Each ping is a real, tool-less model call over your conversation (`$.model.fork`). It spends tokens: on a subscription it counts against your usage, on an API key it is billed. Bun Warmer pings only when your main cache is known to last an hour.
+- Nothing else sends a model request. A stalled subagent is flagged in the state file and under the prompt only; the optional stall prompt (`BUN_WARMER_STALL_PROMPT=on`) is off by default because it starts a model turn.
 
 ## Which cache length you have
 
@@ -87,7 +89,9 @@ Every setting is an environment variable, so it goes in the `env` block of `~/.c
     "BUN_WARMER_ACTIVE_START": "6",
     "BUN_WARMER_ACTIVE_END": "23",
     "BUN_WARMER_STALL_MIN": "20",
-    "BUN_WARMER_STALL_CHECK_MIN": "5"
+    "BUN_WARMER_STALL_CHECK_MIN": "5",
+    "BUN_WARMER_STALL_PROMPT": "off",
+    "BUN_WARMER_KEEP_DAYS": "30"
   }
 }
 ```
@@ -121,7 +125,36 @@ Slash command:
 | `/bunwarm off` | Stops Bun Warmer for this session |
 | `/bunwarm on` | Starts a fresh window for this session |
 
-Bun Warmer keeps a one-line status in the state file (`statusText`, with `statusState` and `nextPingAt`). Claude Code does not show that line by itself: under the prompt you only see Bun Warmer when something needs your attention (it is off and why, a failed ping, a stalled subagent, a state file it could not write). To see the routine line all the time, a [status line](https://code.claude.com/docs/en/statusline) script has to read `statusText` from `~/.claude/bun-warmer/<session-id>.json`, using the `session_id` Claude Code passes the script. The line looks like this:
+### Status line
+
+Bun Warmer keeps a one-line status in the state file (`statusText`, with `statusState` and `nextPingAt`). Claude Code does not show that line by itself: under the prompt you only see Bun Warmer when something needs your attention (it is off and why, a failed ping, a stalled subagent, a state file it could not write). To see the routine line all the time, turn on the ready-made script `bin/statusline.py` as your [status line](https://code.claude.com/docs/en/statusline). It reads the `session_id` Claude Code passes it, reads that session's state file, and prints one line with the countdowns worked out as it runs. It prints nothing when the mod is off for the session.
+
+If you have no status line yet, add this to `~/.claude/settings.json` (top level, not inside `env`):
+
+```json
+{
+  "statusLine": { "type": "command", "command": "python3 /path/to/bun-warmer/bin/statusline.py" }
+}
+```
+
+If you already have one, keep it and add Bun Warmer after it. When your status line is a script that reads its input into a variable (for example `input=$(cat)`), add one line that passes the same input on:
+
+```sh
+printf '%s' "$input" | python3 /path/to/bun-warmer/bin/statusline.py
+```
+
+When it is a single command, wrap it so both get the same input, and replace `<your current command>` with what your `command` says today:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "input=$(cat); printf '%s  %s' \"$(printf '%s' \"$input\" | <your current command>)\" \"$(printf '%s' \"$input\" | python3 /path/to/bun-warmer/bin/statusline.py)\""
+  }
+}
+```
+
+The status line updates as Claude Code refreshes it. The line looks like this:
 
 ```
 bun-warmer · idle · 1h30m left · waiting for the first turn
@@ -151,6 +184,8 @@ An environment variable beats the matching config menu value. The config menu fi
 | Quiet hours | on | env `BUN_WARMER_QUIET_HOURS=off` pings around the clock, still inside the window |
 | Stall threshold | 20 minutes | env `BUN_WARMER_STALL_MIN` |
 | Stall check interval | 5 minutes | env `BUN_WARMER_STALL_CHECK_MIN` |
+| Stall prompt to the main conversation | off | env `BUN_WARMER_STALL_PROMPT=on` (starts a model turn per stall) |
+| Days to keep disarmed state files | 30 | env `BUN_WARMER_KEEP_DAYS` (0 to 3650; 0 never deletes) |
 | Pulse script path | `<plugin folder>/bin/session-pulse.py` | env `BUN_WARMER_PULSE` (absolute path ending in `.py`) |
 
 Allowed ranges: window 1 to 720 minutes (`BUN_WARMER_WINDOW_HOURS` 1/60 to 12), ping interval 5 to 240 minutes (then capped at 55), hard cap 1 to 48 hours, minimum tokens 0 to 2,000,000, stall threshold 1 to 720 minutes, stall check interval 1 to 60 minutes, active hours whole numbers 0 to 23. A value outside its range, or one that is not a number, is ignored and the next source or the default applies. The variable's name (never its value) is added to `configWarnings` in the state file. A value that is clamped, such as an interval above 55, also adds a line there.
@@ -196,13 +231,26 @@ Compaction clears the remembered context size until the next response, so the gu
 
 ### Stall watchdog
 
+A stall is always recorded in the state file and shown under the prompt; a prompt to the main conversation is sent only with `BUN_WARMER_STALL_PROMPT=on`, because that prompt starts a model turn and uses tokens.
+
 While a session has subagents, a second timer checks `$.agent.list()` every 5 minutes. This call is local and costs no tokens. A `running` subagent that has produced no events and has no tool call in flight for 20 minutes is flagged as stalled. A tool call that is still running counts as activity for as long as it runs.
 
 The transcript pulse is a second signal. On each check that finds at least one subagent with status `running`, Bun Warmer runs `python3 <plugin folder>/bin/session-pulse.py <session-id>` (no shell, 10-second timeout). The script reads the tail of the session's transcript files and reports how long each subagent's transcript has been idle. A subagent is flagged only when both the events and the transcript say it has been quiet longer than the threshold. If the pulse is not available, events decide alone and the state file records why. `script-missing` is recorded only after such a check, so it does not appear while no subagent is running. See [`bin/README-session-pulse.md`](bin/README-session-pulse.md) for the script's output.
 
-Each stall is reported once. Bun Warmer adds it to the state file and the status line, and sends one message to the main conversation through `$.prompt.submit`. The message is fixed text plus a sanitized agent id, an allowlisted agent type, the minutes silent and the local time. It tells the model to check the agent in its own Agent list and not to stop or respawn it on this notice alone. The agent's free-text description is never put in the message, because it can contain instructions. Pulse output is treated as untrusted. Its string ids are used only to match the agent ids the engine reports and are never shown; its numbers and booleans drive the stall decision.
+Each stall is reported once. Bun Warmer adds it to the state file and the status line. With `BUN_WARMER_STALL_PROMPT=on` it also sends one message to the main conversation through `$.prompt.submit`; that starts a model turn, which uses tokens (counted against a subscription, billed on an API key). The message is fixed text plus a sanitized agent id, an allowlisted agent type, the minutes silent and the local time. It tells the model to check the agent in its own Agent list and not to stop or respawn it on this notice alone. The agent's free-text description is never put in the message, because it can contain instructions. Pulse output is treated as untrusted. Its string ids are used only to match the agent ids the engine reports and are never shown; its numbers and booleans drive the stall decision.
 
 The message is sent only while the main conversation is idle. While a main turn is running, the message waits until that turn ends. The watchdog never stops or kills anything.
+
+After the machine sleeps, the next stall check runs late. When the gap since the previous check is more than two check intervals, Bun Warmer takes it for a sleep and restarts every subagent's silence clock from that moment (counted in `wakes`), so time spent asleep never counts as silence. A subagent still silent a full threshold after waking is flagged as usual.
+
+### Cleanup
+
+Nothing else removes state files, so at each session start Bun Warmer tidies `~/.claude/bun-warmer/`, in the background, without holding the session up. It removes only:
+
+- state files (`*.json`, not `*.error.json`) older than `BUN_WARMER_KEEP_DAYS` (default 30 days) whose content says `armed: false`, which means the window ended, `/bunwarm off`, `/clear` or session end;
+- leftover temp files (`.*.json.tmp`) older than a day.
+
+It never removes the current session's file, a file it cannot read or parse, a file that does not say `armed: false`, a directory or a link, and at most 500 files per session start. `BUN_WARMER_KEEP_DAYS=0` turns cleanup off. Age is the file's modification time.
 
 ## What it saves
 
@@ -215,8 +263,10 @@ A Claude Opus 5.5 session holds 174,324 tokens of context (**measured**: the med
 Rates for Claude Opus 5.5 (list price): a 1-hour cache write is $8 / MTok, a cache read is $0.20 / MTok.
 
 - Without Bun Warmer, a one-hour cache goes cold at 60 minutes. Your next prompt re-writes the whole context: 174,324 × $8 / 1,000,000 = **$1.39** (calculated).
-- With Bun Warmer, it pings at 50 and 100 minutes. Each ping reads the cache: 174,324 × $0.20 / 1,000,000 = **$0.035** (calculated). Your prompt at 120 minutes reads a warm cache for another $0.035. Total: 3 × $0.035 = **$0.10** (calculated).
+- With Bun Warmer, it pings at 50 and 100 minutes. Each ping reads the cache: 174,324 × $0.20 / 1,000,000 = **$0.035** (calculated, cache read only). Your prompt at 120 minutes reads a warm cache for another $0.035. Total: 3 × $0.035 = **$0.10** (calculated, cache reads only).
 - Saved on this break: $1.39 − $0.10 = **$1.29** (calculated).
+
+What these figures leave out: each ping also bills its own prompt (a few input tokens), its reply (the mod asks for one word but sets no cap on output), and any small cache write. In the author's 35 priced pings below, those extras came to $0.069 of cache writes plus $0.0045 of input and output, $0.0735 in all, about $0.002 a ping (calculated from the table). Your own reply after the break is billed as usual and is not counted here either.
 
 On Claude Opus 5.5 a re-write costs 40 times a read ($8 / $0.20 = 40, calculated), so one avoided re-write pays for 40 pings. If you never come back, the pings are spent for nothing. With the default settings (a ping every 50 minutes, a 180-minute window) that is at most 3 pings, at 50, 100 and 150 minutes: 3 × $0.035 = $0.10 in this example (calculated).
 
@@ -275,6 +325,7 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
   "note": null,
   "stallMin": 20,
   "stallCheckMin": 5,
+  "stallPrompt": false, "keepDays": 30, "wakes": 0, "pingsStopped": false,
   "stalledAgents": [
     { "id": "…", "description": "…", "type": "general-purpose", "minutesSilent": 22, "firstFlaggedAt": "…", "firstFlaggedAtEpoch": 0, "messageSent": true }
   ]
@@ -287,7 +338,8 @@ Notes for readers of the file:
 - Time fields are `null` until the event has happened. `contextTokens` is `null` while the size is unknown.
 - `armed` is `false` after the window ends, `/bunwarm off`, `/clear` or session end, and `note` says which.
 - `refusals` counts pings that failed or were refused. `guardDrops` counts prompts dropped in `refuse` mode. `skippedSmall` counts pings skipped because the context was too small or its size unknown.
-- `messageSent` is `null` while a stall message waits for an idle main conversation, and `false` if sending failed.
+- `messageSent` is `null` while a stall message waits for an idle main conversation, or when the stall prompt is off (`stallPrompt: false`), and `false` if sending failed.
+- `pingsStopped` is `true` once a ping found the cache gone under the subscription default; no more pings go out in that session.
 - Check freshness with `writtenAtEpochMs`. Treat a file older than the ping interval as out of date.
 
 File name: a UUID session id is used as is. Any other character outside `A-Z a-z 0-9 _ -` becomes `%` plus two uppercase hex digits per UTF-8 byte (`a/b` becomes `a%2Fb`).
@@ -301,7 +353,7 @@ If a write fails, the old file is kept and `<session-id>.error.json` is written 
 - If a turn's completion event is never delivered, Bun Warmer keeps treating the main conversation as busy and holds stall messages until the session resets.
 - A ping's events carry no marker. While a ping is in flight, a main-conversation event with no agent id is taken for the ping's and ignored. The next event after the ping counts.
 - A subagent that streams for a long time inside one model step, with no tool call, can look quiet to the watchdog.
-- The transcript layout the pulse reads is not a public Claude Code contract and may change. Idle times come from the wall clock, so they jump after the machine sleeps.
+- The transcript layout the pulse reads is not a public Claude Code contract and may change. Idle times come from the wall clock, so they jump after the machine sleeps; the post-wake grace in the stall watchdog covers that.
 - The transcript pulse finds a subagent by matching the id `$.agent.list()` gives to a transcript file name. If your Claude Code version names the files differently, or the match is ambiguous, the pulse cannot confirm or clear a stall for that subagent. Events alone then decide, so a subagent that is still writing to its transcript can be flagged as stalled.
 - If `$.agent.list()` is unavailable or fails, the stall check for that pass is skipped and nothing is flagged, and a running subagent does not extend the window when it ends.
 - Quiet hours follow the time zone of the process running the mod. A host that runs mods in a different zone would shift the hours.

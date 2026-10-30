@@ -31,7 +31,7 @@ function world(on: On, opts: { env?: Record<string, string>; ctx?: number; pulse
   let ctx = opts.ctx ?? 200000
   let pulse: PulseBehavior = opts.pulse ?? { kind: 'raw', stdout: '' }
   const existing = opts.existing
-  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : e.name === 'BUN_WARMER_STALL_PROMPT' ? 'on' : undefined) }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', async ($, e) => {
     const done = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })

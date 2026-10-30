@@ -156,7 +156,7 @@ describe('no ping unless the main cache is known to last an hour', () => {
   test('subscription with no rate-limit reading yet: no proof it is within plan usage, so no ping', async ($, on) => {
     const { w } = await quietHour(on, $, { rateLimits: [] })
     expect(w.forks.length).toBe(0)
-    expect(w.state().statusText).toContain('not pinging')
+    expect(w.state().planUsageNote).toBe('no plan usage reading yet')
   })
 
   test('subscription whose usage cannot be read: no ping', async ($, on) => {
@@ -186,7 +186,7 @@ describe('no ping unless the main cache is known to last an hour', () => {
     await $.turn.complete(answer())
     await clock.advance(70 * MIN)
     expect(w.forks.length).toBe(1)
-    expect(w.state().cacheTtl).toBe('5m')
+    expect(w.state().pingsStopped).toBe(true)
   })
 
   test('the TTL is read again before every ping: promptCacheTtl changed from 1h to 5m mid-session stops pings', async ($, on) => {
