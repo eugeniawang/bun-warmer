@@ -16,7 +16,7 @@ function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' |
   let agents: Agent[] = []
   // These tests predate quiet hours and run at an arbitrary hour of the machine's day: quiet hours stay off unless a test sets them. tests/quiet.test.ts covers them.
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : e.name === 'BUN_WARMER_STALL_PROMPT' ? 'on' : undefined) }))
-  on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
+  on('fs.write', ($, e) => { try { const t = JSON.parse(e.text).statusText; if (t && e.path.endsWith('.tmp')) status.push(t) } catch { /* not the state file */ } files.set(e.path, e.text); return { value: undefined } })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv
     if (cmd === 'mv') { finals.set(to, files.get(from) ?? ''); files.delete(from) }
@@ -29,7 +29,7 @@ function world(on: On, env: Record<string, string> = {}, submit: 'ok' | 'drop' |
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 1000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 10 }] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: agents as never }))
-  on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
+  on('ui.status', () => ({ value: undefined }))
   const logs: string[] = []
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
   on('turn.complete', ($, e) => ({ text: e.answer }))

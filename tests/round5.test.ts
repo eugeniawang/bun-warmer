@@ -27,7 +27,7 @@ function world(on: On, env: Record<string, string> = {}, opts: { pulse?: Pulse; 
   let agents: Agent[] = []
   let pulse = opts.pulse ?? null
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : e.name === 'BUN_WARMER_STALL_PROMPT' ? 'on' : undefined) }))
-  on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
+  on('fs.write', ($, e) => { try { const t = JSON.parse(e.text).statusText; if (t && e.path.endsWith('.tmp')) status.push(t) } catch { /* not the state file */ } files.set(e.path, e.text); return { value: undefined } })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv
     const done = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -42,7 +42,7 @@ function world(on: On, env: Record<string, string> = {}, opts: { pulse?: Pulse; 
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 1000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 10 }] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: agents as never }))
-  on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
+  on('ui.status', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))

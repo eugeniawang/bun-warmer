@@ -466,7 +466,7 @@ describe('bun-warmer', () => {
     expect(JSON.parse(w.files.get('/home/t/.claude/bun-warmer/S1.error.json') ?? 'null').error).toMatch(/write failed/)
   })
 
-  test('a double failure removes the old state file; if that fails too the status line and log say so', async ($, on) => {
+  test('a double failure removes the old state file; if that fails too the log says so', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])
     await $.session.start(start)
@@ -489,12 +489,11 @@ describe('bun-warmer', () => {
     await clock.advance(1500)
     await $.turn.complete(answer())
     expect(w.state().writtenAtEpochMs).toBe(oldMs)
-    expect(w.status.at(-1)).toMatch(/STATE FILE NOT WRITTEN and the old one could not be removed/)
+    // no state file can carry the warning, and the UI shows no second line: the log is the one place left
     expect(w.logs.some(l => /could not be removed/.test(l))).toBe(true)
     w.fail.mv = false; w.fail.errWrite = false; w.fail.rmFinal = false
     await $.turn.complete(answer())
     expect(w.state().writtenAtEpochMs).toBeGreaterThan(oldMs)
-    expect(w.status.at(-1) ?? '').not.toMatch(/NOT WRITTEN/)
   })
 
   test('writtenAt has millisecond precision, with epoch milliseconds', async ($, on) => {

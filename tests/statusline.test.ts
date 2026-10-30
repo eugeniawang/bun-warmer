@@ -85,7 +85,20 @@ describe('routine activity never touches the UI', () => {
     await $.session.start(start)
     for (let i = 0; i < 5; i++) await $.turn.complete(answer())
     await clock.advance(51 * MIN)
-    expect(w.uiCalls).toEqual([])
+    expect(w.uiCalls.filter(c => c !== undefined)).toEqual([])
     expect(w.status.at(-1)).toMatch(/^bun-warmer · warm · /)
+  })
+})
+
+describe('the UI never shows a bun-warmer line', () => {
+  test('off, a failed ping and a stall put no text in the UI; only the first status() clears an old line', async ($, on) => {
+    const clock = mock.clock(on, { now: at(2026, 10, 14, 10) })
+    const w = world(on)
+    await $.session.start(start)
+    await $.turn.complete(answer())
+    await $.command.run({ command: 'bunwarm', args: 'off', origin: { kind: 'composer' } } as never)
+    await clock.advance(51 * MIN)
+    expect(w.uiCalls.filter(c => c !== undefined)).toEqual([])
+    expect(w.uiCalls.length).toBeLessThanOrEqual(1)
   })
 })

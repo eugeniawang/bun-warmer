@@ -151,7 +151,7 @@ type State = {
   planNote: string | null
   /** Set when a ping found the cache gone under the subscription default: no more pings this session, whatever a re-read says. */
   ttlLatched: boolean
-  /** Whether a stalled subagent also gets a prompt submitted to the main conversation (BUN_WARMER_STALL_PROMPT=on). Off: state file and alert only. */
+  /** Whether a stalled subagent also gets a prompt submitted to the main conversation (BUN_WARMER_STALL_PROMPT=on). Off: state file only. */
   stallPrompt: boolean
   /** Days a disarmed state file is kept before session-start cleanup removes it; 0 keeps every file. */
   keepDays: number
@@ -352,7 +352,7 @@ function resetSession() {
   errorFileWritten = false
   inFlight.clear()
   durabilityNote = null
-  shownAlert = ''
+  uiCleared = false
 }
 
 /** /clear fires session.end but no session.start; every event handler calls this so the id is always the live one. */
@@ -449,12 +449,12 @@ function nextPingAt(st: State): number {
   return at < warmAt + COLD_AFTER_MS ? at : 0
 }
 
-/** What the status line would say right now, split into the routine part and the alert part (off, failed ping, stall, durability). */
-function describe(now: number): { text: string; alert: string; state: string; pingAt: number } {
+/** What the status line would say right now, for the state file. */
+function describe(now: number): { text: string; state: string; pingAt: number } {
   const dur = durabilityNote ? ` · ${durabilityNote}` : ''
   if (!s.armed) {
     const text = s.note ? `bun-warmer off: ${s.note}${stallText()}${dur}` : (stallText() + dur).slice(3)
-    return { text, alert: text, state: 'off', pingAt: 0 }
+    return { text, state: 'off', pingAt: 0 }
   }
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
@@ -463,7 +463,7 @@ function describe(now: number): { text: string; alert: string; state: string; pi
   if (!hourCache(s) && !pendingPlan) {
     // Shown once in the UI (it does not change on its own), so a newcomer learns why the mod sends nothing.
     const text = `bun-warmer off: ${ttlNote(s)}${fail}${stall}${dur}`
-    return { text, alert: text, state: 'off', pingAt: 0 }
+    return { text, state: 'off', pingAt: 0 }
   }
   // Warm or cold is the cache's state (lastWarmAt); "ping in" is nextPingAt, the same answer the scheduler acts on.
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
@@ -478,23 +478,21 @@ function describe(now: number): { text: string; alert: string; state: string; pi
     : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
     : !pingAt ? `no ping before the cache goes cold in ${fmtDur(warmAt + COLD_AFTER_MS - now)}`
     : `ping in ${fmtDur(pingAt - now)}`
-  return { text: `bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`, alert: `${fail}${stall}${dur}`, state, pingAt }
+  return { text: `bun-warmer · ${state} · ${fmtDur(s.expiresAt - now)} left · ${next}${fail}${stall}${dur}`, state, pingAt }
 }
 
-/** The last alert shown. The UI status (and, in Remote Control, the transcript) is touched only when this changes, never for countdown ticks. */
-let shownAlert = ''
+/** Whether this process has cleared any UI status line an older version left showing. */
+let uiCleared = false
 
-/** Routine status lives in the state file (statusText) for the real status line to read. The UI is told only about alerts: off, a failed ping, a stalled subagent, a write failure. */
+/** Everything lives in the state file (statusText, statusState, lastPing, stalledAgents) for the one status-line row to read. The UI is never given text: a second bun-warmer line is not wanted. The first call clears a line an older version may have left stuck. */
 function status($: EngineInterface, now: number) {
   const d = describe(now)
   s.statusText = d.text
   s.statusState = d.state
   s.nextPingAt = d.pingAt
-  // Minute counts (a stall's "23m") change on their own; only a new or cleared alert is worth a line.
-  const key = d.alert.replace(/ \d+m\b/g, '')
-  if (key === shownAlert) return
-  shownAlert = key
-  return $.ui.status(d.alert ? (s.armed ? d.text : d.alert) : undefined)
+  if (uiCleared) return
+  uiCleared = true
+  return $.ui.status(undefined)
 }
 
 function stallText(): string {
@@ -734,7 +732,7 @@ export async function stallCheck($: EngineInterface) {
   }
   // $.prompt.submit queues behind a busy main loop, and the API has no way to withdraw a queued prompt. So a message goes out only
   // while no main-loop turn is running; a flagged agent waits (messageSent null) and is sent on a later pass once the loop is idle.
-  // Opt-in only: a submitted prompt starts a model turn, which uses tokens. Off, a stall is in the state file and the alert alone.
+  // Opt-in only: a submitted prompt starts a model turn, which uses tokens. Off, a stall is in the state file alone.
   const due = s.stallPrompt && mainTurns.size === 0 ? s.stalled.filter(f => f.messageSent === null) : []
   for (const f of due) {
     // Disarmed, or the session changed under us while an earlier message was pending: send nothing more.
