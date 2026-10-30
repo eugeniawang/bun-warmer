@@ -76,6 +76,11 @@ describe('resolveCacheTtl follows Anthropic precedence', () => {
   test('a model-specific disable (DISABLE_PROMPT_CACHING_HAIKU, _SONNET, _OPUS, _FABLE) counts as off: Bun Warmer cannot tell which model it covers', () => {
     expect(resolveCacheTtl({ ...base, disabledModel: 'DISABLE_PROMPT_CACHING_HAIKU' }).ttl).toBe('off')
   })
+  test('a value that would turn the hour on must be exact: padded 1h or 1 does not count', () => {
+    expect(resolveCacheTtl({ ...base, auth: 'api-key', envTtl: ' 1h ' }).ttl).toBe('5m')
+    expect(resolveCacheTtl({ ...base, auth: 'api-key', settingTtl: '1h ' }).ttl).toBe('5m')
+    expect(resolveCacheTtl({ ...base, auth: 'api-key', enable1h: ' 1' }).ttl).toBe('5m')
+  })
   test('DISABLE_PROMPT_CACHING=1: no cache at all', () => {
     expect(resolveCacheTtl({ ...base, disabled: '1' }).ttl).toBe('off')
   })

@@ -38,8 +38,10 @@ export const SUBSCRIPTION_DEFAULT = 'Claude subscription default'
  * unknown with no first-party login. Values other than `5m` or `1h` are ignored, as Claude Code ignores them.
  */
 export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
+  // Values that lower or turn off the cache are read leniently (padding allowed); values that turn the hour on must be exact, so a value
+  // Claude Code might ignore never makes Bun Warmer ping.
   const on = (v: string | undefined) => v !== undefined && v.trim() === '1'
-  const ttlOf = (v: unknown): '5m' | '1h' | null => typeof v === 'string' && (v.trim() === '5m' || v.trim() === '1h') ? v.trim() as '5m' | '1h' : null
+  const ttlOf = (v: unknown): '5m' | '1h' | null => v === '1h' ? '1h' : typeof v === 'string' && v.trim() === '5m' ? '5m' : null
   if (on(i.disabled)) return { ttl: 'off', why: 'DISABLE_PROMPT_CACHING is set' }
   // A per-model disable covers whichever model its alias resolves to; Bun Warmer cannot tell whether that is this session's, so it stays off.
   if (i.disabledModel) return { ttl: 'off', why: `${i.disabledModel} is set` }
@@ -48,7 +50,7 @@ export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
   if (env) return { ttl: env, why: 'CLAUDE_CODE_PROMPT_CACHE_TTL' }
   const setting = ttlOf(i.settingTtl)
   if (setting) return { ttl: setting, why: 'promptCacheTtl setting' }
-  if (on(i.enable1h)) return { ttl: '1h', why: 'ENABLE_PROMPT_CACHING_1H is set' }
+  if (i.enable1h === '1') return { ttl: '1h', why: 'ENABLE_PROMPT_CACHING_1H is set' }
   if (i.auth === 'bearer') return { ttl: '1h', why: SUBSCRIPTION_DEFAULT }
   if (i.auth === 'api-key') return { ttl: '5m', why: 'API key login' }
   if (i.auth === 'none') return { ttl: 'unknown', why: 'no Claude login found (cloud provider or gateway)' }
