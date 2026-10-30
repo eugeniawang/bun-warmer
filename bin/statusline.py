@@ -13,6 +13,7 @@ cannot be read, or the mod is off for the session because its window ended,
 or unknown cache), it prints the mod's own reason. Standard library only.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -41,30 +42,35 @@ def dur(seconds):
     return "%dh%02dm" % (h, m) if h > 0 else "%dm" % m
 
 
+def num(v):
+    """A finite number from the state file, else 0: a malformed file never breaks the status line."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
+
+
 def segment(state, now):
     """The line for a parsed state file at `now` (epoch seconds), or '' for nothing to show."""
     if not isinstance(state, dict) or state.get("armed") is not True:
         return ""
-    expires = state.get("expiresAtEpoch") or 0
-    if not isinstance(expires, (int, float)) or expires <= now:
+    expires = num(state.get("expiresAtEpoch"))
+    if expires <= now:
         return ""
     if state.get("statusState") == "off":
         text = state.get("statusText")
         return text if isinstance(text, str) else ""
     last_ping = state.get("lastPing") if isinstance(state.get("lastPing"), dict) else {}
-    activity = state.get("lastActivityAtEpoch") or 0
-    good_ping = (last_ping.get("atEpoch") or 0) if last_ping.get("ok") is True else 0
+    activity = num(state.get("lastActivityAtEpoch"))
+    good_ping = num(last_ping.get("atEpoch")) if last_ping.get("ok") is True else 0
     warm_at = max(activity, good_ping)
     word = "idle" if not warm_at else ("cold" if now - warm_at >= HOUR else "warm")
     parts = ["bun-warmer", word, "%s left" % dur(expires - now)]
-    next_ping = state.get("nextPingAtEpoch") or 0
+    next_ping = num(state.get("nextPingAtEpoch"))
     # The mod's own words for what comes next, e.g. "context under 50,000 tokens, not pinging" or "quiet hours, pings resume 06:00".
     said = state.get("statusText").split(" · ") if isinstance(state.get("statusText"), str) else []
     # Used only when the mod saw the same state word, so a reason never outlives the state it was written for.
     reason = said[3] if len(said) > 3 and said[0] == "bun-warmer" and said[1] == word else ""
     if reason and not reason.startswith("ping in"):
         parts.append(reason)
-    elif word == "warm" and isinstance(next_ping, (int, float)) and next_ping > now:
+    elif word == "warm" and next_ping > now:
         parts.append("ping in %s" % dur(next_ping - now))
     if last_ping and last_ping.get("ok") is False:
         parts.append("last ping FAILED")

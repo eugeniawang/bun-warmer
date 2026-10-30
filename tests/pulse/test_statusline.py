@@ -62,6 +62,12 @@ class Segment(unittest.TestCase):
         self.assertEqual(sl.segment(state(expiresAtEpoch=NOW - 1), NOW), "")
         self.assertEqual(sl.segment(None, NOW), "")
 
+    def test_malformed_numbers_never_raise(self):
+        for bad in ["123", float("nan"), float("inf"), None, True, [1]]:
+            s = state(lastActivityAtEpoch=bad, nextPingAtEpoch=bad, lastPing={"ok": True, "atEpoch": bad})
+            sl.segment(s, NOW)
+            self.assertEqual(sl.segment(state(expiresAtEpoch=bad), NOW), "")
+
     def test_safe_name_matches_the_mod(self):
         self.assertEqual(sl.safe_name("89e8e7d6-ca67-44fd-bb20-87b456e44dca"), "89e8e7d6-ca67-44fd-bb20-87b456e44dca")
         self.assertEqual(sl.safe_name("a/b"), "a%2Fb")
