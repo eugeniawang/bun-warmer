@@ -26,7 +26,7 @@ function world(on: On, env: Record<string, string> = {}, opts: { pulse?: Pulse; 
   const sent: string[] = []
   let agents: Agent[] = []
   let pulse = opts.pulse ?? null
-  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : undefined) }))
+  on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name] ?? (e.name === 'BUN_WARMER_QUIET_HOURS' ? 'off' : e.name === 'BUN_WARMER_STALL_PROMPT' ? 'on' : undefined) }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', ($, e) => {
     const [cmd, , from, to] = e.argv

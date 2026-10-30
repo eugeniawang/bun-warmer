@@ -13,8 +13,11 @@ const DEFAULT_ACTIVE_START = 6
 const DEFAULT_ACTIVE_END = 23
 // Allowed range of each numeric setting; a value outside it is ignored with a recorded warning.
 const RANGE = {
-  window: [1, 720], interval: [5, 240], maxHours: [1, 48], minTokens: [0, 2_000_000], stall: [1, 720], stallCheck: [1, 60],
+  window: [1, 720], interval: [5, 240], maxHours: [1, 48], minTokens: [0, 2_000_000], stall: [1, 720], stallCheck: [1, 60], keepDays: [0, 3650],
 } as const
+const DEFAULT_KEEP_DAYS = 30
+/** Most state files one session start removes, so a huge folder never holds a session up. */
+const CLEANUP_MAX = 500
 
 /** Prompt origins that are a person typing. Everything else (subagent returns, task notifications, peers, schedules, plugins, the SDK) is never blocked. */
 const HUMAN_ORIGINS = ['composer', 'bridge']
@@ -58,12 +61,13 @@ export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
 }
 
 /** True when pings may go out: the main cache is known to last an hour, and a subscription default is backed by a current plan-usage reading. */
-function hourCache(st: { cacheTtl: CacheTtl; planNote: string | null }): boolean {
-  return st.cacheTtl === '1h' && !st.planNote
+function hourCache(st: { cacheTtl: CacheTtl; planNote: string | null; ttlLatched: boolean }): boolean {
+  return st.cacheTtl === '1h' && !st.planNote && !st.ttlLatched
 }
 
 /** Why no ping goes out for a cache that is not known to last an hour, in the status line's words. */
-function ttlNote(st: { cacheTtl: CacheTtl; cacheTtlWhy: string; planNote: string | null }): string {
+function ttlNote(st: { cacheTtl: CacheTtl; cacheTtlWhy: string; planNote: string | null; ttlLatched: boolean }): string {
+  if (st.ttlLatched) return 'a ping found the cache gone, so this session is not on the one-hour cache; not pinging again this session'
   if (st.cacheTtl === '1h' && st.planNote) return `main cache may be 5 minutes (${st.planNote}), not pinging`
   if (st.cacheTtl === 'off') return `prompt caching is off (${st.cacheTtlWhy}), not pinging`
   if (st.cacheTtl === '5m') return `main cache lasts 5 minutes (${st.cacheTtlWhy}), so a ping cannot keep it warm; not pinging`
@@ -147,6 +151,12 @@ type State = {
   planNote: string | null
   /** Set when a ping found the cache gone under the subscription default: no more pings this session, whatever a re-read says. */
   ttlLatched: boolean
+  /** Whether a stalled subagent also gets a prompt submitted to the main conversation (BUN_WARMER_STALL_PROMPT=on). Off: state file and alert only. */
+  stallPrompt: boolean
+  /** Days a disarmed state file is kept before session-start cleanup removes it; 0 keeps every file. */
+  keepDays: number
+  /** Stall checks that found the machine had slept (a long gap between checks) and restarted every silence clock. */
+  wakes: number
   /** Settings that were out of range or not usable at session start, each with the default that replaced it. Our own words plus the variable name, never a raw value. */
   warnings: string[]
 }
@@ -195,6 +205,10 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     cacheTtl: s.cacheTtl,
     cacheTtlReason: s.cacheTtlWhy,
     planUsageNote: s.planNote,
+    pingsStopped: s.ttlLatched,
+    stallPrompt: s.stallPrompt,
+    keepDays: s.keepDays,
+    wakes: s.wakes,
     pulse: s.pulse && { available: s.pulse.available, reason: s.pulse.reason, checkedAt: isoLocal(s.pulse.checkedAt), checkedAtEpoch: epoch(s.pulse.checkedAt), agentsSeen: s.pulse.agentsSeen },
     maxHours: s.maxMs / HOUR,
     note: s.note,
@@ -277,7 +291,7 @@ export function freshState(): State {
     lastPing: null, statusText: '', statusState: 'off', nextPingAt: 0, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
-    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet', planNote: null, ttlLatched: false,
+    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet', planNote: null, ttlLatched: false, stallPrompt: false, keepDays: DEFAULT_KEEP_DAYS, wakes: 0,
   }
 }
 
@@ -301,6 +315,8 @@ let stallTimer: { cancel: () => void } | null = null
 /** Last event seen per subagent id (turn.step, turn.complete, tool.call carrying that agentId). Not persisted. */
 const lastEventAt = new Map<string, number>()
 let pinging = false
+/** When the last stall check ran, to tell a late timer (the machine slept) from a normal one. 0 before the first. */
+let lastStallCheckAt = 0
 /** Bumped by resetSession: a ping, tick or watchdog pass that began under an older value belongs to a session that is gone and must not write into the new one. */
 let generation = 0
 /** Bumped by resetSession and by every disarm: a stall message prepared under an older value must not be sent. */
@@ -327,8 +343,9 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings, stallPrompt: s.stallPrompt, keepDays: s.keepDays })
   lastEventAt.clear()
+  lastStallCheckAt = 0
   mainTurns.clear()
   errorFileWritten = false
   inFlight.clear()
@@ -439,7 +456,9 @@ function describe(now: number): { text: string; alert: string; state: string; pi
   }
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
-  if (!hourCache(s)) {
+  // "No reading yet" is routine before the first response; only a definite answer (5 minutes, unknown, off, credits, a ping that found it gone) turns the mod off.
+  const pendingPlan = s.cacheTtl === '1h' && !s.ttlLatched && s.planNote !== null && !s.planNote.includes('usage credits')
+  if (!hourCache(s) && !pendingPlan) {
     // Shown once in the UI (it does not change on its own), so a newcomer learns why the mod sends nothing.
     const text = `bun-warmer off: ${ttlNote(s)}${fail}${stall}${dur}`
     return { text, alert: text, state: 'off', pingAt: 0 }
@@ -453,6 +472,7 @@ function describe(now: number): { text: string; alert: string; state: string; pi
   const next = !base ? 'waiting for the first turn'
     : isQuiet(now) ? `quiet hours, pings resume ${hhmm(nextActiveMoment(now, s.activeStart, s.activeEnd))}`
     : cold ? 'cache cold, waiting for activity'
+    : pendingPlan ? `${s.planNote}, not pinging yet`
     : s.ctx < s.minTokens ? (s.ctx ? `context under ${s.minTokens.toLocaleString('en-US')} tokens, not pinging` : 'context size unknown, not pinging')
     : !pingAt ? `no ping before the cache goes cold in ${fmtDur(warmAt + COLD_AFTER_MS - now)}`
     : `ping in ${fmtDur(pingAt - now)}`
@@ -541,6 +561,81 @@ function touchAgent(id: string | undefined, now: number) {
   lastEventAt.set(id, now)
 }
 
+/**
+ * True when the gap since the last stall check is more than two check intervals: the timer fired late, which on a laptop means it slept.
+ * Silence measured across a sleep is not silence, so the caller restarts every silence clock. `prev` 0 is the first check.
+ */
+export function afterSleep(prev: number, now: number, checkMs: number): boolean {
+  return prev > 0 && now - prev > 2 * checkMs
+}
+
+/**
+ * What session-start cleanup may touch, from a listing of ~/.claude/bun-warmer: `check` are state files (`*.json`, not `*.error.json`) older than
+ * `keepDays`, to be read and removed only if they say `armed: false`; `remove` are orphan temp files (`.*.json.tmp`) older than a day. Never the
+ * session's own file, never a directory or link. `keepDays` 0 touches nothing.
+ */
+export function cleanupTargets(entries: ReadonlyArray<{ name: string; kind: string; mtimeMs: number }>, now: number, keepDays: number, own: string): { check: string[]; remove: string[] } {
+  if (!(keepDays > 0)) return { check: [], remove: [] }
+  const check: string[] = []
+  const remove: string[] = []
+  for (const e of entries) {
+    if (!e || e.kind !== 'file' || typeof e.name !== 'string' || e.name.includes('/') || e.name === own || !Number.isFinite(e.mtimeMs)) continue
+    const age = now - e.mtimeMs
+    if (e.name.startsWith('.bwclean-')) continue // a file cleanup set aside and could not put back: never deleted by a later pass
+    if (e.name.startsWith('.') && e.name.endsWith('.json.tmp')) { if (age > 24 * HOUR) remove.push(e.name); continue }
+    if (e.name.endsWith('.json') && !e.name.endsWith('.error.json') && age > keepDays * 24 * HOUR) check.push(e.name)
+  }
+  return { check, remove }
+}
+
+/**
+ * Removes one listed file only if, after it is moved aside under a name no session writes, the moved file is still a plain old file (and, for
+ * a state file, says `armed: false`). A session that rewrote the name in the gap either lands its write after the move (its new file stays)
+ * or had its file moved (it fails the check and is moved back unless a newer one took the name). So only the very file that was checked is deleted.
+ */
+async function removeIfStillOld($: EngineInterface, dir: string, name: string, cutoff: number, needDisarmed: boolean): Promise<boolean> {
+  const from = `${dir}/${name}`
+  const aside = `${dir}/.bwclean-${Math.random().toString(36).slice(2)}-${name}`
+  if ((await $.process.run(['mv', '-n', '--', from, aside])).exitCode !== 0) return false
+  let remove = false
+  try {
+    const st = await $.fs.stat(aside)
+    if (!st.isLink && st.kind === 'file' && st.mtimeMs < cutoff) {
+      if (!needDisarmed) remove = true
+      else {
+        const j = JSON.parse(String(await $.fs.read(aside))) as Record<string, unknown> | null
+        remove = !!j && typeof j === 'object' && j.armed === false
+      }
+    }
+  } catch { remove = false }
+  if (remove) return (await $.process.run(['rm', '-f', '--', aside])).exitCode === 0
+  // Not ours to delete: put it back. If a newer file has taken the name since, the moved copy is left aside (`.bwclean-*`, never deleted).
+  try { await $.process.run(['mv', '-n', '--', aside, from]) } catch { /* left aside */ }
+  return false
+}
+
+/** Removes old disarmed state files and orphan temp files. Conservative: a file that cannot be read or parsed, or is not `armed: false`, stays. Never throws. */
+async function cleanup($: EngineInterface) {
+  try {
+    if (!(s.keepDays > 0)) return
+    const home = await $.env.get('HOME')
+    if (!home) return
+    const dir = `${home}/.claude/bun-warmer`
+    const now = await $.clock.now()
+    const { check, remove } = cleanupTargets(await $.fs.list(dir), now, s.keepDays, `${safeName(s.sid)}.json`)
+    let removed = 0
+    for (const name of remove) {
+      if (removed >= CLEANUP_MAX) break
+      try { if (await removeIfStillOld($, dir, name, now - 24 * HOUR, false)) removed++ } catch { /* next */ }
+    }
+    for (const name of check) {
+      if (removed >= CLEANUP_MAX) break
+      try { if (await removeIfStillOld($, dir, name, now - s.keepDays * 24 * HOUR, true)) removed++ } catch { /* kept */ }
+    }
+    if (removed) await safeLog($, `removed ${removed} old state file${removed === 1 ? '' : 's'} (older than ${s.keepDays} days, BUN_WARMER_KEEP_DAYS)`)
+  } catch { /* the folder may not exist yet; cleanup is best effort */ }
+}
+
 /** Starts with a notice that is harmless if it arrives late: it names the time, says when to ignore it, and suggests nothing destructive. */
 export const STALL_PREFIX = 'Bun Warmer notice sent at '
 
@@ -584,6 +679,14 @@ export async function stallCheck($: EngineInterface) {
   }
   const now = await $.clock.now()
   if (token !== epoch_) return
+  let changed = false
+  if (afterSleep(lastStallCheckAt, now, s.stallCheckMs)) {
+    // Post-wake grace: every silence clock restarts now, so nothing is flagged for silence that was really the machine asleep.
+    for (const id of lastEventAt.keys()) lastEventAt.set(id, now)
+    s.wakes++
+    changed = true
+  }
+  lastStallCheckAt = now
   const running = new Map<string, { description: string; type: string }>()
   const listedIds = new Set<string>(list.filter(a => a && typeof a.id === 'string').map(a => a.id))
   for (const a of list) {
@@ -597,7 +700,6 @@ export async function stallCheck($: EngineInterface) {
   // The transcript pulse is a second signal. Asked once per check, only while some agent is running.
   const pulse = running.size ? await readPulse($, now) : null
   if (token !== epoch_) return
-  let changed = false
   if (running.size) {
     const rec: PulseRecord = { available: pulse?.available === true, reason: pulse?.available === true ? null : (pulse?.reason ?? 'not-run'), checkedAt: now, agentsSeen: pulse?.available === true ? pulse.agents.size : 0 }
     if (!s.pulse || s.pulse.available !== rec.available || s.pulse.reason !== rec.reason || s.pulse.agentsSeen !== rec.agentsSeen) changed = true
@@ -630,7 +732,8 @@ export async function stallCheck($: EngineInterface) {
   }
   // $.prompt.submit queues behind a busy main loop, and the API has no way to withdraw a queued prompt. So a message goes out only
   // while no main-loop turn is running; a flagged agent waits (messageSent null) and is sent on a later pass once the loop is idle.
-  const due = mainTurns.size === 0 ? s.stalled.filter(f => f.messageSent === null) : []
+  // Opt-in only: a submitted prompt starts a model turn, which uses tokens. Off, a stall is in the state file and the alert alone.
+  const due = s.stallPrompt && mainTurns.size === 0 ? s.stalled.filter(f => f.messageSent === null) : []
   for (const f of due) {
     // Disarmed, or the session changed under us while an earlier message was pending: send nothing more.
     if (!s.armed || token !== epoch_) break
@@ -870,10 +973,8 @@ async function ping($: EngineInterface, now: number) {
   if (gen !== generation) return
   s.lastPing = result
   if (!result.ok && result.read !== null && s.cacheTtlWhy === SUBSCRIPTION_DEFAULT) {
+    // The cache did not last the interval: this session is not getting the hour (on usage credits, a plan without it, or a prefix change). Stop paying for pings.
     s.ttlLatched = true
-    // The cache did not last the interval: this session is not getting the hour (on usage credits, or a plan without it). Stop paying for pings.
-    s.cacheTtl = '5m'
-    s.cacheTtlWhy = 'a ping found the cache already gone, so this session is not on the one-hour cache'
   }
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
@@ -978,6 +1079,7 @@ export const register: Register = (on, options) => {
       BUN_WARMER_MAX_HOURS: await $.env.get('BUN_WARMER_MAX_HOURS'),
       BUN_WARMER_STALL_MIN: await $.env.get('BUN_WARMER_STALL_MIN'),
       BUN_WARMER_STALL_CHECK_MIN: await $.env.get('BUN_WARMER_STALL_CHECK_MIN'),
+      BUN_WARMER_KEEP_DAYS: await $.env.get('BUN_WARMER_KEEP_DAYS'),
     }
     const num = (name: string, min: number, max: number) => bounded(name, rawEnv[name], min, max, warnings)
     const envInterval = num('BUN_WARMER_INTERVAL_MIN', ...RANGE.interval)
@@ -996,6 +1098,8 @@ export const register: Register = (on, options) => {
     s.maxMs = (num('BUN_WARMER_MAX_HOURS', ...RANGE.maxHours) ?? DEFAULT_MAX_HOURS) * HOUR
     s.stallMs = (num('BUN_WARMER_STALL_MIN', ...RANGE.stall) ?? 20) * MIN
     s.stallCheckMs = (num('BUN_WARMER_STALL_CHECK_MIN', ...RANGE.stallCheck) ?? 5) * MIN
+    s.keepDays = num('BUN_WARMER_KEEP_DAYS', ...RANGE.keepDays) ?? DEFAULT_KEEP_DAYS
+    s.stallPrompt = (await $.env.get('BUN_WARMER_STALL_PROMPT'))?.trim().toLowerCase() === 'on'
     s.quietEnabled = !quietHoursOff(await $.env.get('BUN_WARMER_QUIET_HOURS'))
     const rawStart = await $.env.get('BUN_WARMER_ACTIVE_START')
     const rawEnd = await $.env.get('BUN_WARMER_ACTIVE_END')
@@ -1008,6 +1112,8 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
     await arm($, await $.clock.now())
+    // Not awaited: removing old files never holds the session up.
+    void cleanup($)
     return r
   })
 
