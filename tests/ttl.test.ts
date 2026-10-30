@@ -73,6 +73,9 @@ describe('resolveCacheTtl follows Anthropic precedence', () => {
   test('values other than 5m or 1h are ignored, as Claude Code ignores them', () => {
     expect(resolveCacheTtl({ ...base, auth: 'api-key', envTtl: '60m', settingTtl: 'one hour' }).ttl).toBe('5m')
   })
+  test('a model-specific disable (DISABLE_PROMPT_CACHING_HAIKU, _SONNET, _OPUS, _FABLE) counts as off: Bun Warmer cannot tell which model it covers', () => {
+    expect(resolveCacheTtl({ ...base, disabledModel: 'DISABLE_PROMPT_CACHING_HAIKU' }).ttl).toBe('off')
+  })
   test('DISABLE_PROMPT_CACHING=1: no cache at all', () => {
     expect(resolveCacheTtl({ ...base, disabled: '1' }).ttl).toBe('off')
   })
@@ -124,6 +127,14 @@ describe('no ping unless the main cache is known to last an hour', () => {
     const { w } = await quietHour(on, $, { auth: { handle: 'h', kind: 'api-key' }, settings: { promptCacheTtl: '1h' } })
     expect(w.forks.length).toBe(1)
   })
+
+  for (const name of ['DISABLE_PROMPT_CACHING_HAIKU', 'DISABLE_PROMPT_CACHING_SONNET', 'DISABLE_PROMPT_CACHING_OPUS', 'DISABLE_PROMPT_CACHING_FABLE']) {
+    test(`subscription with ${name}=1: never pings`, async ($, on) => {
+      const { w } = await quietHour(on, $, { env: { [name]: '1' } })
+      expect(w.forks.length).toBe(0)
+      expect(w.state().cacheTtl).toBe('off')
+    })
+  }
 
   test('subscription with FORCE_PROMPT_CACHING_5M=1: never pings', async ($, on) => {
     const { w } = await quietHour(on, $, { env: { FORCE_PROMPT_CACHING_5M: '1' } })

@@ -22,7 +22,7 @@ Bun Warmer reads the same inputs Claude Code uses for the main conversation, in 
 4. `ENABLE_PROMPT_CACHING_1H=1`: one hour.
 5. Otherwise, your login: a Claude subscription login means one hour; an API key means 5 minutes; no first-party login (a cloud provider or a gateway) means unknown, and unknown means no pings.
 
-`DISABLE_PROMPT_CACHING=1` means there is no cache, so no pings. Any value other than `5m` or `1h` is ignored, as Claude Code ignores it. The result is in the state file as `cacheTtl` (`1h`, `5m`, `unknown` or `off`) with `cacheTtlReason`.
+`DISABLE_PROMPT_CACHING=1` means there is no cache, so no pings. Any of the per-model disables (`DISABLE_PROMPT_CACHING_HAIKU`, `_SONNET`, `_OPUS`, `_FABLE`) set to `1` also means no pings, because Bun Warmer cannot tell whether it covers your session's model. Any value other than `5m` or `1h` is ignored, as Claude Code ignores it. The result is in the state file as `cacheTtl` (`1h`, `5m`, `unknown` or `off`) with `cacheTtlReason`.
 
 On a subscription with no TTL setting, a login alone does not prove the hour, because a subscription past its plan limit draws on usage credits and gets 5 minutes. So before each ping Bun Warmer reads the plan's rate-limit windows (`five_hour`, `seven_day`, the ones Claude Code reports after each response) and pings only when at least one was read and all are under 100%. No reading yet, a reading that fails, or a window at 100% means no ping; pings resume once a later reading is under the limit. If a ping still finds the cache gone, Bun Warmer stops pinging for the rest of the session. An explicit `1h` (variable or setting) holds on usage credits too, so it needs no reading.
 

@@ -28,7 +28,7 @@ type PulseRecord = { available: boolean; reason: string | null; checkedAt: numbe
 export type CacheTtl = '1h' | '5m' | 'unknown' | 'off'
 
 /** The inputs Claude Code itself uses, each raw. `auth`: `bearer` (a Claude subscription login), `api-key`, `none` (no first-party credential: a cloud provider or gateway), `unknown` (could not be read). */
-export type TtlInputs = { force5m: string | undefined; envTtl: string | undefined; settingTtl: unknown; enable1h: string | undefined; disabled: string | undefined; auth: 'bearer' | 'api-key' | 'none' | 'unknown' }
+export type TtlInputs = { force5m: string | undefined; envTtl: string | undefined; settingTtl: unknown; enable1h: string | undefined; disabled: string | undefined; disabledModel?: string | null; auth: 'bearer' | 'api-key' | 'none' | 'unknown' }
 
 export const SUBSCRIPTION_DEFAULT = 'Claude subscription default'
 
@@ -41,6 +41,8 @@ export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
   const on = (v: string | undefined) => v !== undefined && v.trim() === '1'
   const ttlOf = (v: unknown): '5m' | '1h' | null => typeof v === 'string' && (v.trim() === '5m' || v.trim() === '1h') ? v.trim() as '5m' | '1h' : null
   if (on(i.disabled)) return { ttl: 'off', why: 'DISABLE_PROMPT_CACHING is set' }
+  // A per-model disable covers whichever model its alias resolves to; Bun Warmer cannot tell whether that is this session's, so it stays off.
+  if (i.disabledModel) return { ttl: 'off', why: `${i.disabledModel} is set` }
   if (on(i.force5m)) return { ttl: '5m', why: 'FORCE_PROMPT_CACHING_5M is set' }
   const env = ttlOf(i.envTtl)
   if (env) return { ttl: env, why: 'CLAUDE_CODE_PROMPT_CACHE_TTL' }
@@ -927,7 +929,14 @@ async function readCacheTtl($: EngineInterface): Promise<{ ttl: CacheTtl; why: s
     const a = await $.session.authorize()
     auth = a === null ? 'none' : a.kind === 'bearer' ? 'bearer' : a.kind === 'api-key' ? 'api-key' : 'unknown'
   } catch { auth = 'unknown' }
+  const isOne = (v: string | undefined) => v !== undefined && v.trim() === '1'
+  const disabledModel = isOne(await get($.env.get('DISABLE_PROMPT_CACHING_HAIKU'))) ? 'DISABLE_PROMPT_CACHING_HAIKU'
+    : isOne(await get($.env.get('DISABLE_PROMPT_CACHING_SONNET'))) ? 'DISABLE_PROMPT_CACHING_SONNET'
+    : isOne(await get($.env.get('DISABLE_PROMPT_CACHING_OPUS'))) ? 'DISABLE_PROMPT_CACHING_OPUS'
+    : isOne(await get($.env.get('DISABLE_PROMPT_CACHING_FABLE'))) ? 'DISABLE_PROMPT_CACHING_FABLE'
+    : null
   return resolveCacheTtl({
+    disabledModel,
     disabled: await get($.env.get('DISABLE_PROMPT_CACHING')),
     force5m: await get($.env.get('FORCE_PROMPT_CACHING_5M')),
     envTtl: await get($.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')),
