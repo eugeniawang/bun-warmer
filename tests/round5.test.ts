@@ -38,6 +38,7 @@ function world(on: On, env: Record<string, string> = {}, opts: { pulse?: Pulse; 
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 1000 }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: agents as never }))

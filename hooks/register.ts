@@ -24,6 +24,42 @@ type StalledAgent = { id: string; description: string; type: string; minutesSile
 /** What the last stall check learned from the transcript pulse. Only our own fixed reason words, never text taken from the pulse. */
 type PulseRecord = { available: boolean; reason: string | null; checkedAt: number; agentsSeen: number }
 
+/** How long the main conversation's prompt cache lives, as Claude Code decides it (https://code.claude.com/docs/en/prompt-caching, "Which TTL each request gets"). `unknown`: no first-party login, or the login kind could not be read. `off`: caching disabled. */
+export type CacheTtl = '1h' | '5m' | 'unknown' | 'off'
+
+/** The inputs Claude Code itself uses, each raw. `auth`: `bearer` (a Claude subscription login), `api-key`, `none` (no first-party credential: a cloud provider or gateway), `unknown` (could not be read). */
+export type TtlInputs = { force5m: string | undefined; envTtl: string | undefined; settingTtl: unknown; enable1h: string | undefined; disabled: string | undefined; auth: 'bearer' | 'api-key' | 'none' | 'unknown' }
+
+export const SUBSCRIPTION_DEFAULT = 'Claude subscription default'
+
+/**
+ * The main conversation's cache lifetime, first match in Anthropic's order: FORCE_PROMPT_CACHING_5M=1, CLAUDE_CODE_PROMPT_CACHE_TTL,
+ * the promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H=1, then the default: one hour only on a Claude subscription, five minutes on an API key,
+ * unknown with no first-party login. Values other than `5m` or `1h` are ignored, as Claude Code ignores them.
+ */
+export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
+  const on = (v: string | undefined) => v !== undefined && v.trim() === '1'
+  const ttlOf = (v: unknown): '5m' | '1h' | null => typeof v === 'string' && (v.trim() === '5m' || v.trim() === '1h') ? v.trim() as '5m' | '1h' : null
+  if (on(i.disabled)) return { ttl: 'off', why: 'DISABLE_PROMPT_CACHING is set' }
+  if (on(i.force5m)) return { ttl: '5m', why: 'FORCE_PROMPT_CACHING_5M is set' }
+  const env = ttlOf(i.envTtl)
+  if (env) return { ttl: env, why: 'CLAUDE_CODE_PROMPT_CACHE_TTL' }
+  const setting = ttlOf(i.settingTtl)
+  if (setting) return { ttl: setting, why: 'promptCacheTtl setting' }
+  if (on(i.enable1h)) return { ttl: '1h', why: 'ENABLE_PROMPT_CACHING_1H is set' }
+  if (i.auth === 'bearer') return { ttl: '1h', why: SUBSCRIPTION_DEFAULT }
+  if (i.auth === 'api-key') return { ttl: '5m', why: 'API key login' }
+  if (i.auth === 'none') return { ttl: 'unknown', why: 'no Claude login found (cloud provider or gateway)' }
+  return { ttl: 'unknown', why: 'the login kind could not be read' }
+}
+
+/** Why no ping goes out for a cache that is not known to last an hour, in the status line's words. */
+function ttlNote(st: { cacheTtl: CacheTtl; cacheTtlWhy: string }): string {
+  if (st.cacheTtl === 'off') return `prompt caching is off (${st.cacheTtlWhy}), not pinging`
+  if (st.cacheTtl === '5m') return `main cache lasts 5 minutes (${st.cacheTtlWhy}), so a ping cannot keep it warm; not pinging`
+  return `main cache length unknown (${st.cacheTtlWhy}), not pinging; set CLAUDE_CODE_PROMPT_CACHE_TTL=1h to opt in`
+}
+
 type PingResult = { at: number; ok: boolean; reason: string | null; read: number | null; write: number | null; model?: string | null; usd?: number | null }
 
 // $ per million tokens, [cache read, 1h cache write, output], Anthropic list prices October 2026.
@@ -94,6 +130,9 @@ type State = {
   /** Pings not sent because the context was below minTokens or its size was not yet known. */
   skippedSmall: number
   pulse: PulseRecord | null
+  /** The main conversation's cache lifetime and where that answer came from. Pings go out only for `1h`. */
+  cacheTtl: CacheTtl
+  cacheTtlWhy: string
   /** Settings that were out of range or not usable at session start, each with the default that replaced it. Our own words plus the variable name, never a raw value. */
   warnings: string[]
 }
@@ -139,6 +178,8 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     contextTokens: s.ctx || null,
     skippedSmall: s.skippedSmall,
     configWarnings: s.warnings,
+    cacheTtl: s.cacheTtl,
+    cacheTtlReason: s.cacheTtlWhy,
     pulse: s.pulse && { available: s.pulse.available, reason: s.pulse.reason, checkedAt: isoLocal(s.pulse.checkedAt), checkedAtEpoch: epoch(s.pulse.checkedAt), agentsSeen: s.pulse.agentsSeen },
     maxHours: s.maxMs / HOUR,
     note: s.note,
@@ -221,6 +262,7 @@ export function freshState(): State {
     lastPing: null, statusText: '', statusState: 'off', nextPingAt: 0, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
+    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet',
   }
 }
 
@@ -270,7 +312,7 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings, cacheTtl: s.cacheTtl, cacheTtlWhy: s.cacheTtlWhy })
   lastEventAt.clear()
   mainTurns.clear()
   errorFileWritten = false
@@ -363,6 +405,7 @@ function lastWarmAt(st: State): number {
  * is not retried sooner than one interval; warm or cold counts only lastWarmAt, so no ping, retry or not, goes out once the cache is cold.
  */
 function nextPingAt(st: State): number {
+  if (st.cacheTtl !== '1h') return 0
   const base = Math.max(st.lastActivityAt, st.lastPingAt)
   const warmAt = lastWarmAt(st)
   if (!base || !warmAt) return 0
@@ -379,6 +422,11 @@ function describe(now: number): { text: string; alert: string; state: string; pi
   }
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
+  if (s.cacheTtl !== '1h') {
+    // Shown once in the UI (it does not change on its own), so a newcomer learns why the mod sends nothing.
+    const text = `bun-warmer off: ${ttlNote(s)}${fail}${stall}${dur}`
+    return { text, alert: text, state: 'off', pingAt: 0 }
+  }
   // Warm or cold is the cache's state (lastWarmAt); "ping in" is nextPingAt, the same answer the scheduler acts on.
   const base = Math.max(s.lastActivityAt, s.lastPingAt)
   const warmAt = lastWarmAt(s)
@@ -743,6 +791,14 @@ async function tick($: EngineInterface) {
     await persist($)
     return
   }
+  await refreshCtx($)
+  if (gen !== generation) return
+  if (s.cacheTtl !== '1h') {
+    schedule($, now)
+    status($, now)
+    await persist($)
+    return
+  }
   if (isQuiet(now)) {
     // Due during quiet hours: skipped, not failed. Not a refusal, lastPing untouched; the cache may go cold on purpose.
     s.skippedQuiet++
@@ -794,6 +850,11 @@ async function ping($: EngineInterface, now: number) {
   // The session was cleared or resumed while the fork was out: its answer belongs to nobody now.
   if (gen !== generation) return
   s.lastPing = result
+  if (!result.ok && result.read !== null && s.cacheTtlWhy === SUBSCRIPTION_DEFAULT) {
+    // The cache did not last the interval: this session is not getting the hour (on usage credits, or a plan without it). Stop paying for pings.
+    s.cacheTtl = '5m'
+    s.cacheTtlWhy = 'a ping found the cache already gone, so this session is not on the one-hour cache'
+  }
   // Even a failed ping is an attempt that was paid for or refused; do not retry sooner than one interval.
   s.lastPingAt = now
   if (result.ok) s.lastWarmPingAt = now
@@ -825,9 +886,37 @@ async function activity($: EngineInterface, human: boolean, agentId?: string) {
 
 async function refreshCtx($: EngineInterface) {
   try {
-    const live = (await $.session.usage()).context.tokens
+    const u = await $.session.usage()
+    const live = u.context.tokens
     if (live && live > 0) s.ctx = live
+    // A subscription past a plan window is billed from usage credits, where Claude Code drops the main cache to five minutes
+    // unless the person chose the TTL. Only the subscription default is downgraded; an explicit 1h holds on credits too.
+    const over = (u.rateLimits ?? []).some(r => (r.kind === 'five_hour' || r.kind === 'seven_day') && typeof r.percentUsed === 'number' && r.percentUsed >= 100)
+    if (over && s.cacheTtl === '1h' && s.cacheTtlWhy === SUBSCRIPTION_DEFAULT) {
+      s.cacheTtl = '5m'
+      s.cacheTtlWhy = 'subscription past its plan limit, on usage credits'
+    }
   } catch { /* usage is advisory */ }
+}
+
+/** Reads what decides the main cache's lifetime: the four variables, the promptCacheTtl setting and the login kind. Any read that fails counts as unset, the login as unknown. */
+async function readCacheTtl($: EngineInterface): Promise<{ ttl: CacheTtl; why: string }> {
+  const get = async (p: Promise<string | undefined>) => { try { return await p } catch { return undefined } }
+  let settingTtl: unknown
+  try { settingTtl = ((await $.settings.read()) as Record<string, unknown> | undefined)?.promptCacheTtl } catch { settingTtl = undefined }
+  let auth: TtlInputs['auth'] = 'unknown'
+  try {
+    const a = await $.session.authorize()
+    auth = a === null ? 'none' : a.kind === 'bearer' ? 'bearer' : a.kind === 'api-key' ? 'api-key' : 'unknown'
+  } catch { auth = 'unknown' }
+  return resolveCacheTtl({
+    disabled: await get($.env.get('DISABLE_PROMPT_CACHING')),
+    force5m: await get($.env.get('FORCE_PROMPT_CACHING_5M')),
+    envTtl: await get($.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')),
+    settingTtl,
+    enable1h: await get($.env.get('ENABLE_PROMPT_CACHING_1H')),
+    auth,
+  })
 }
 
 export const register: Register = (on, options) => {
@@ -871,6 +960,9 @@ export const register: Register = (on, options) => {
     if (rawStart !== undefined && hourSetting(rawStart, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_START ignored: not a whole hour from 0 to 23, so the default applies')
     if (rawEnd !== undefined && hourSetting(rawEnd, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_END ignored: not a whole hour from 0 to 23, so the default applies')
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
+    const ttl = await readCacheTtl($)
+    s.cacheTtl = ttl.ttl
+    s.cacheTtlWhy = ttl.why
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
     await arm($, await $.clock.now())
@@ -907,6 +999,7 @@ export const register: Register = (on, options) => {
     if (word === 'off') { await disarm($, 'turned off'); return { text: 'bun-warmer is off for this session' } }
     if (word === 'on') { await arm($, now); return { text: `bun-warmer on for ${fmtDur(s.windowMs)}, a ping after ${fmtDur(s.intervalMs)} of quiet` } }
     if (!s.armed) return { text: `bun-warmer is off${s.note ? ` (${s.note})` : ''}` }
+    if (s.cacheTtl !== '1h') return { text: `bun-warmer on but ${ttlNote(s)}` }
     const fail = s.lastPing && !s.lastPing.ok ? `; last ping FAILED: ${s.lastPing.reason}` : s.lastPing ? '; last ping ok' : ''
     return { text: `bun-warmer on, ${fmtDur(s.expiresAt - now)} left, ${s.refusals} failed or refused pings${s.skippedQuiet ? `, ${s.skippedQuiet} skipped for quiet hours` : ''}${fail}` }
   })
@@ -927,7 +1020,8 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     // The cold period is named by the moment the cache was last refreshed, so a successful ping after the last activity keeps it warm.
     const warmAt = lastWarmAt(s)
-    const cold = warmAt > 0 && now - warmAt >= COLD_AFTER_MS
+    // Only an hour-long cache is kept warm, so only there is a cold send worth a warning.
+    const cold = s.cacheTtl === '1h' && warmAt > 0 && now - warmAt >= COLD_AFTER_MS
     const typed = typeof e.text === 'string' && !e.text.trimStart().startsWith('/')
     if (typed && cold && s.ctx >= s.minTokens) {
       const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - warmAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`

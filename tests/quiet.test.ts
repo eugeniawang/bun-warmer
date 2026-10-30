@@ -32,6 +32,7 @@ function world(on: On, clock: Clock, env: Record<string, string> = {}) {
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: sid }))
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'hi', toolUses: [] }] as never }))
   on('session.compact', () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] as never }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1000000, tokens: 200000 }, rateLimits: [] } }))

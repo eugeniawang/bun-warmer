@@ -1,12 +1,39 @@
 # Bun Warmer
 
-Bun Warmer is a mod for Claude Code users who take breaks during long sessions. Claude Code caches your conversation for 60 minutes. After a longer break, your next message re-writes the whole context at the cache-write rate, which is slow and costly. Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 3 hours after your last prompt. It also flags subagents that go silent.
+Bun Warmer is a mod for Claude Code users who take breaks during long sessions. Claude Code caches your conversation so the next message does not re-process it. How long that cache lasts depends on how you pay: on a Claude subscription within your plan's included usage the main conversation's cache lasts **60 minutes**; with an API key, a cloud provider (Bedrock, Vertex, Foundry), or a subscription drawing on usage credits it lasts **5 minutes**, unless you chose one hour yourself ([Anthropic: Which TTL each request gets](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets)). After a break longer than the cache, your next message re-writes the whole context at the cache-write rate, which is slow and costly.
+
+When your main cache lasts an hour, Bun Warmer sends a small ping after 50 minutes of quiet so the cache stays warm, for up to 3 hours after your last prompt. When it lasts 5 minutes, or Bun Warmer cannot tell, it sends no pings at all, because a ping every few minutes would cost more than it saves; the state file and a one-time note under the prompt say why. It also flags subagents that go silent.
+
+## What this installs
+
+- One hooks module, `hooks/register.ts`, which Claude Code loads as a mod when you point it at this folder. Nothing is installed system-wide and no background process runs outside Claude Code.
+- One slash command, `/bunwarm` (status, on, off).
+- One state file per session in `~/.claude/bun-warmer/<session-id>.json`, rewritten as the session runs. Old files are not removed yet; you can delete them at any time.
+- A Python script, `bin/session-pulse.py` (standard library only), which the mod runs with `python3` while subagents are running, to read the session's local transcript files and check they are still being written.
+- Pings. Each ping is a real, tool-less model call over your conversation (`$.model.fork`). It spends tokens: on a subscription it counts against your usage, on an API key it is billed. Bun Warmer pings only when your main cache is known to last an hour.
+
+## Which cache length you have
+
+Bun Warmer reads the same inputs Claude Code uses, in Claude Code's order, when a session starts:
+
+1. `FORCE_PROMPT_CACHING_5M=1`: 5 minutes, no pings.
+2. `CLAUDE_CODE_PROMPT_CACHE_TTL` (`5m` or `1h`).
+3. The `promptCacheTtl` setting (`5m` or `1h`).
+4. `ENABLE_PROMPT_CACHING_1H=1`: one hour.
+5. Otherwise, your login: a Claude subscription login means one hour; an API key means 5 minutes; no first-party login (a cloud provider or a gateway) means unknown, and unknown means no pings.
+
+`DISABLE_PROMPT_CACHING=1` means there is no cache, so no pings. Any value other than `5m` or `1h` is ignored, as Claude Code ignores it. The result is in the state file as `cacheTtl` (`1h`, `5m`, `unknown` or `off`) with `cacheTtlReason`.
+
+On a subscription with no TTL setting, Bun Warmer also stops pinging for the rest of the session when it sees you are past your plan's limit (a `five_hour` or `seven_day` rate-limit window at 100%), or when a ping finds the cache already gone: either means this session is not on the one-hour cache.
+
+- **Claude subscription (Pro, Max, Team, Enterprise) within plan usage:** works as is.
+- **API key, usage credits, or a cloud provider:** Bun Warmer does nothing unless you choose the one-hour cache yourself. Set `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (or `"promptCacheTtl": "1h"`) in `~/.claude/settings.json`; this needs Claude Code 2.1.242 or later. One-hour cache writes cost more than five-minute ones (on the API, 2x the input price against 1.25x), so decide that on its own merits first. To check which TTL your writes use, run `claude -p "hello" --output-format json` and look at `usage.cache_creation`: one-hour writes are under `ephemeral_1h_input_tokens`.
 
 Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal (MIT). Bun Warmer is written from scratch; none of its code is copied.
 
 ## Requirements
 
-- Claude Code with the function-hook mod (plugin) API, which is early access. The plugin does not declare a minimum version; it has been tested on Claude Code 2.1.302.
+- Claude Code with the function-hook mod (plugin) API, which is early access. The plugin does not declare a minimum version; it has been tested on Claude Code 2.1.314. Check yours with `claude --version`. If your version does not have the mod API, the mod does not load and `/bunwarm` does not respond (step 5 below); update Claude Code and try again.
 - A POSIX host (macOS or Linux). Bun Warmer builds paths with `/` and runs `mv`, `rm` and `test`, so it does not run on Windows.
 - `python3` on your `PATH` for the transcript pulse (a small script that reads the session's local transcript files to confirm a subagent is still writing; `bin/session-pulse.py`, standard library only). Without it the stall watchdog still works from events alone.
 
@@ -36,6 +63,36 @@ claude --plugin-dir /path/to/bun-warmer
 
 5. Type `/bunwarm`. It answers `bun-warmer on, ... left`. You can also check that `~/.claude/bun-warmer/<session-id>.json` exists.
 
+### A settings example
+
+Every setting is an environment variable, so it goes in the `env` block of `~/.claude/settings.json` beside `CLAUDE_CODE_PLUGIN_DIRS`. Values are strings. Leave out any line you do not need; each default is in [Configuration](#configuration).
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/bun-warmer",
+    "BUN_WARMER_WINDOW_MIN": "180",
+    "BUN_WARMER_INTERVAL_MIN": "50",
+    "BUN_WARMER_QUIET_HOURS": "on",
+    "BUN_WARMER_ACTIVE_START": "6",
+    "BUN_WARMER_ACTIVE_END": "23",
+    "BUN_WARMER_STALL_MIN": "20",
+    "BUN_WARMER_STALL_CHECK_MIN": "5"
+  }
+}
+```
+
+Only on an API key, usage credits or a cloud provider, and only if you want the one-hour cache (it changes what every request costs, not just Bun Warmer's): add `"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"`.
+
+### Updating
+
+```
+cd /path/to/bun-warmer
+git pull
+```
+
+Then start a new Claude Code session. A running session keeps the version it loaded.
+
 To uninstall, remove the folder from `CLAUDE_CODE_PLUGIN_DIRS` (or stop passing `--plugin-dir`) and start a new session.
 
 ### If you use cache-tax
@@ -54,7 +111,7 @@ Slash command:
 | `/bunwarm off` | Stops Bun Warmer for this session |
 | `/bunwarm on` | Starts a fresh window for this session |
 
-The status line shows the state, the time left in the window, and what happens next:
+Bun Warmer keeps a one-line status in the state file (`statusText`, with `statusState` and `nextPingAt`). Claude Code does not show that line by itself: under the prompt you only see Bun Warmer when something needs your attention (it is off and why, a failed ping, a stalled subagent, a state file it could not write). To see the routine line all the time, a [status line](https://code.claude.com/docs/en/statusline) script has to read `statusText` from `~/.claude/bun-warmer/<session-id>.json`, using the `session_id` Claude Code passes the script. The line looks like this:
 
 ```
 bun-warmer · idle · 1h30m left · waiting for the first turn
@@ -66,7 +123,7 @@ bun-warmer · cold · 20m left · cache cold, waiting for activity
 - `warm` means there was activity or a successful ping in the last 60 minutes.
 - `cold` means 60 minutes have passed with no activity or successful ping.
 
-The last part can also read `quiet hours, pings resume 06:00`, `context under 50,000 tokens, not pinging`, or `context size unknown, not pinging`. A failed ping adds `last ping FAILED: <reason>`, and a silent subagent adds `STALLED: <id> <N>m`. When the mod is off, the line reads `bun-warmer off: <reason>`.
+When your main cache is not known to last an hour, the line reads `bun-warmer off: main cache lasts 5 minutes (<why>), so a ping cannot keep it warm; not pinging` or `bun-warmer off: main cache length unknown (<why>), not pinging; ...`, and no ping goes out. The last part can also read `quiet hours, pings resume 06:00`, `context under 50,000 tokens, not pinging`, or `context size unknown, not pinging`. A failed ping adds `last ping FAILED: <reason>`, and a silent subagent adds `STALLED: <id> <N>m`. When the mod is off, the line reads `bun-warmer off: <reason>`.
 
 ## Configuration
 
@@ -94,10 +151,11 @@ Active hours: a start greater than the end wraps midnight (22 and 6 means active
 
 ### Pings
 
-After the ping interval passes with no activity, Bun Warmer sends a short, tool-less ping through `$.model.fork`. The ping reads the cache, which resets its 60-minute lifetime. Pings continue for the window after your last typed prompt.
+After the ping interval passes with no activity, Bun Warmer sends a short, tool-less ping through `$.model.fork`. The ping reads the cache, which resets its one-hour lifetime. Pings go out only when the main cache is known to last an hour (see [Which cache length you have](#which-cache-length-you-have)). Pings continue for the window after your last typed prompt.
 
 Bun Warmer never pings:
 
+- a session whose main cache lasts 5 minutes, has unknown length, or is turned off;
 - a cache that is already cold (60 minutes since any activity), because the ping would pay the full re-write;
 - a session whose context is under the minimum token count, or whose size is not yet known (the size comes from `$.session.usage()` after each response);
 - during quiet hours (06:00 to 23:00 local time is active by default).
@@ -110,7 +168,7 @@ Subagent turns count as activity. When the window ends while a subagent is still
 
 ### Cold-send guard
 
-The cache counts as warm when there was activity or a successful ping within the last 60 minutes; a failed ping does not count. When you type a prompt into a session whose cache has gone cold, the guard notes how many tokens the send will re-write. In the default `warn` mode it only logs that note. In `refuse` mode it drops your first send once with that note; send again to go ahead. It drops only once per cold period: after the next activity or successful ping, a later cold period is guarded again. The guard only looks at prompts a person typed (origins `composer` and `bridge`). Subagent returns, task notifications, scheduled prompts, SDK and plugin messages always pass through. Bun Warmer does not know model prices, so it shows tokens, not dollars.
+The guard runs only for a one-hour cache. The cache counts as warm when there was activity or a successful ping within the last 60 minutes; a failed ping does not count. When you type a prompt into a session whose cache has gone cold, the guard notes how many tokens the send will re-write. In the default `warn` mode it only logs that note. In `refuse` mode it drops your first send once with that note; send again to go ahead. It drops only once per cold period: after the next activity or successful ping, a later cold period is guarded again. The guard only looks at prompts a person typed (origins `composer` and `bridge`). Subagent returns, task notifications, scheduled prompts, SDK and plugin messages always pass through. Bun Warmer does not know model prices, so it shows tokens, not dollars.
 
 ### Quiet hours
 
@@ -146,7 +204,7 @@ A Claude Opus 5.5 session holds 174,324 tokens of context (**measured**: the med
 
 Rates for Claude Opus 5.5 (list price): a 1-hour cache write is $8 / MTok, a cache read is $0.20 / MTok.
 
-- Without Bun Warmer, the cache goes cold at 60 minutes. Your next prompt re-writes the whole context: 174,324 × $8 / 1,000,000 = **$1.39** (calculated).
+- Without Bun Warmer, a one-hour cache goes cold at 60 minutes. Your next prompt re-writes the whole context: 174,324 × $8 / 1,000,000 = **$1.39** (calculated).
 - With Bun Warmer, it pings at 50 and 100 minutes. Each ping reads the cache: 174,324 × $0.20 / 1,000,000 = **$0.035** (calculated). Your prompt at 120 minutes reads a warm cache for another $0.035. Total: 3 × $0.035 = **$0.10** (calculated).
 - Saved on this break: $1.39 − $0.10 = **$1.29** (calculated).
 
@@ -203,6 +261,7 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
   "pulse": { "available": true, "reason": null, "checkedAt": "…", "checkedAtEpoch": 0, "agentsSeen": 1 },
   "maxHours": 12,
   "configWarnings": [],
+  "cacheTtl": "1h", "cacheTtlReason": "Claude subscription default",
   "note": null,
   "stallMin": 20,
   "stallCheckMin": 5,
@@ -227,6 +286,7 @@ If a write fails, the old file is kept and `<session-id>.error.json` is written 
 
 ## Limitations
 
+- Bun Warmer cannot ask Claude Code which cache length a request got. It reads the same settings and login kind Claude Code reads. A subscription that starts drawing on usage credits mid-session is noticed only from the rate-limit reading after a response, or when a ping finds the cache gone; that one ping pays for a re-write before pings stop.
 - The mod API cannot withdraw a queued prompt. Bun Warmer re-checks its state just before it sends a stall message, but if you run `/bunwarm off` or `/clear` in that instant, one stall message can still arrive late. The message starts with the time it was sent and says to ignore it if the mod was turned off or the subagent has finished.
 - If a turn's completion event is never delivered, Bun Warmer keeps treating the main conversation as busy and holds stall messages until the session resets.
 - A ping's events carry no marker. While a ping is in flight, a main-conversation event with no agent id is taken for the ping's and ignored. The next event after the ping counts.

@@ -14,6 +14,7 @@ function world(on: On, env: Record<string, string> = {}) {
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'hi', toolUses: [] }] as never }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1000000, tokens: 200000 }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
