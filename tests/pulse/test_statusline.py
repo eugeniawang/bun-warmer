@@ -20,6 +20,11 @@ def state(**over):
     s = {"armed": True, "expiresAtEpoch": NOW + 130 * 60, "statusState": "warm", "lastActivityAtEpoch": NOW - 13 * 60,
          "nextPingAtEpoch": NOW + 37 * 60, "lastPing": None, "stalledAgents": [], "statusText": "x"}
     s.update(over)
+    if "lastWarmAtEpochMs" not in over and not over.get("legacy"):
+        lp = s.get("lastPing") or {}
+        good = lp.get("atEpoch", 0) if lp.get("ok") is True else 0
+        s["lastWarmAtEpochMs"] = max(s.get("lastActivityAtEpoch") or 0, good) * 1000 or None
+    s.pop("legacy", None)
     return s
 
 
@@ -70,6 +75,15 @@ class Segment(unittest.TestCase):
         s["lastWarmAtEpochMs"] = (NOW - 60 * 60) * 1000
         self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · cold"), sl.segment(s, NOW))
 
+    def test_a_file_from_before_lastWarmAtEpochMs_shows_the_state_word_the_mod_wrote(self):
+        # Activity 105m ago, good ping 55m ago, failed ping 5m ago: an old file keeps only the failed ping, so the script
+        # cannot rebuild lastWarmAt; it shows the mod's own word instead of guessing.
+        s = state(legacy=True, statusState="warm", lastActivityAtEpoch=NOW - 105 * 60, lastPing={"ok": False, "atEpoch": NOW - 5 * 60})
+        self.assertNotIn("lastWarmAtEpochMs", s)
+        self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · warm"), sl.segment(s, NOW))
+        s = state(legacy=True, statusState="cold")
+        self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · cold"), sl.segment(s, NOW))
+
     def test_rounding_matches_the_hooks_Math_round(self):
         self.assertEqual(sl.dur(30), "1m")
         self.assertEqual(sl.dur(150), "3m")
@@ -82,7 +96,9 @@ class Segment(unittest.TestCase):
 
     def test_malformed_numbers_never_raise(self):
         for bad in ["123", float("nan"), float("inf"), None, True, [1]]:
-            s = state(lastActivityAtEpoch=bad, nextPingAtEpoch=bad, lastPing={"ok": True, "atEpoch": bad})
+            s = state(lastActivityAtEpoch=bad, nextPingAtEpoch=bad, lastWarmAtEpochMs=bad, nextPingAtEpochMs=bad, lastPing={"ok": True, "atEpoch": bad})
+            sl.segment(s, NOW)
+            s = state(legacy=True, lastActivityAtEpoch=bad, statusState=bad, lastPing={"ok": True, "atEpoch": bad})
             sl.segment(s, NOW)
             self.assertEqual(sl.segment(state(expiresAtEpoch=bad), NOW), "")
 

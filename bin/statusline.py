@@ -66,13 +66,14 @@ def segment(state, now):
         text = state.get("statusText")
         return text if isinstance(text, str) else ""
     last_ping = state.get("lastPing") if isinstance(state.get("lastPing"), dict) else {}
-    # The hook's lastWarmAt: activity or a ping that found the cache warm; a failed ping never counts. Files from before
-    # lastWarmAtEpochMs existed fall back to activity or the last ping when it was good.
-    warm_at = num(state.get("lastWarmAtEpochMs"))
-    if not warm_at and "lastWarmAtEpochMs" not in state:
-        good_ping = num(last_ping.get("atEpoch")) * 1000 if last_ping.get("ok") is True else 0
-        warm_at = max(ms(state, "lastActivityAt"), good_ping)
-    word = "idle" if not warm_at else ("cold" if now_ms - warm_at >= HOUR_MS else "warm")
+    # The hook's lastWarmAt: activity or a ping that found the cache warm; a failed ping never counts.
+    if "lastWarmAtEpochMs" in state:
+        warm_at = num(state.get("lastWarmAtEpochMs"))
+        word = "idle" if not warm_at else ("cold" if now_ms - warm_at >= HOUR_MS else "warm")
+    else:
+        # A file written before lastWarmAtEpochMs existed cannot rebuild lastWarmAt (it keeps only the last ping), so show the
+        # state word the mod wrote, as of its last write. The next write by a current version adds the field.
+        word = state.get("statusState") if state.get("statusState") in ("idle", "warm", "cold") else "idle"
     parts = ["bun-warmer", word, "%s left" % dur((expires - now_ms) / 1000)]
     next_ping = ms(state, "nextPingAt")
     # The mod's own words for what comes next, e.g. "context under 50,000 tokens, not pinging" or "quiet hours, pings resume 06:00".
