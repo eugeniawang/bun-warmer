@@ -308,7 +308,8 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
   "windowStartAt": "…",    "windowStartAtEpoch": 0,
   "lastPingAt": "…",       "lastPingAtEpoch": 0,
   "lastActivityAt": "…",   "lastActivityAtEpoch": 0,
-  "expiresAt": "…",        "expiresAtEpoch": 0,
+  "expiresAt": "…",        "expiresAtEpoch": 0, "expiresAtEpochMs": 0,
+  "lastWarmAtEpochMs": 0,
   "refusals": 0,
   "guardDrops": 0,
   "quietHours": { "enabled": true, "activeStartHour": 6, "activeEndHour": 23 },
@@ -335,6 +336,7 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
 Notes for readers of the file:
 
 - Use `lastActivityAt` for real activity. Pings move `lastPingAt` only.
+- `lastWarmAtEpochMs` is what Bun Warmer judges warm or cold from: the later of the last activity and the last ping that found the cache warm (a failed ping never moves it). The cache counts as cold 60 minutes after it. `bin/statusline.py` reads this field, and the `*EpochMs` times, so it never disagrees with the mod.
 - Time fields are `null` until the event has happened. `contextTokens` is `null` while the size is unknown.
 - `armed` is `false` after the window ends, `/bunwarm off`, `/clear` or session end, and `note` says which.
 - `refusals` counts pings that failed or were refused. `guardDrops` counts prompts dropped in `refuse` mode. `skippedSmall` counts pings skipped because the context was too small or its size unknown.

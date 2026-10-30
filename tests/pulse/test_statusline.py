@@ -62,6 +62,24 @@ class Segment(unittest.TestCase):
         self.assertEqual(sl.segment(state(expiresAtEpoch=NOW - 1), NOW), "")
         self.assertEqual(sl.segment(None, NOW), "")
 
+    def test_a_failed_ping_after_a_good_one_judges_like_the_hook(self):
+        # Activity at -105m, good ping at -55m, failed ping at -5m: the hook's lastWarmAt is the good ping, so still warm.
+        s = state(lastActivityAtEpoch=NOW - 105 * 60, lastWarmAtEpochMs=(NOW - 55 * 60) * 1000, lastPing={"ok": False, "atEpoch": NOW - 5 * 60})
+        self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · warm"), sl.segment(s, NOW))
+        # At exactly 60 minutes after the good ping it is cold, as in the hook (now - warmAt >= 60 min).
+        s["lastWarmAtEpochMs"] = (NOW - 60 * 60) * 1000
+        self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · cold"), sl.segment(s, NOW))
+
+    def test_rounding_matches_the_hooks_Math_round(self):
+        self.assertEqual(sl.dur(30), "1m")
+        self.assertEqual(sl.dur(150), "3m")
+        self.assertEqual(sl.dur(29.999), "0m")
+        self.assertEqual(sl.dur(-30), "0m")
+
+    def test_millisecond_fields_are_preferred(self):
+        s = state(expiresAtEpochMs=(NOW + 90) * 1000 + 0, expiresAtEpoch=NOW + 90, nextPingAtEpochMs=(NOW + 30) * 1000, nextPingAtEpoch=NOW + 30)
+        self.assertEqual(sl.segment(s, NOW), "bun-warmer · warm · 2m left · ping in 1m")
+
     def test_malformed_numbers_never_raise(self):
         for bad in ["123", float("nan"), float("inf"), None, True, [1]]:
             s = state(lastActivityAtEpoch=bad, nextPingAtEpoch=bad, lastPing={"ok": True, "atEpoch": bad})

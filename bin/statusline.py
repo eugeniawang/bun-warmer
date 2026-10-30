@@ -18,7 +18,7 @@ import os
 import sys
 import time
 
-HOUR = 3600
+HOUR_MS = 3600 * 1000
 
 
 def safe_name(sid):
@@ -37,7 +37,8 @@ def safe_name(sid):
 
 
 def dur(seconds):
-    total = max(0, round(seconds / 60))
+    # The hook's Math.max(0, Math.round(ms / 60000)): halves round up (Python's round() would round 2.5 to 2).
+    total = max(0, math.floor(seconds / 60 + 0.5))
     h, m = divmod(total, 60)
     return "%dh%02dm" % (h, m) if h > 0 else "%dm" % m
 
@@ -47,31 +48,41 @@ def num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
 
 
+def ms(state, name):
+    """`<name>EpochMs` when the file has it, else `<name>Epoch` seconds as milliseconds, else 0."""
+    exact = num(state.get(name + "EpochMs"))
+    return exact if exact else num(state.get(name + "Epoch")) * 1000
+
+
 def segment(state, now):
-    """The line for a parsed state file at `now` (epoch seconds), or '' for nothing to show."""
+    """The line for a parsed state file at `now` (epoch seconds), or '' for nothing to show. Judged as the hook judges it, in milliseconds."""
     if not isinstance(state, dict) or state.get("armed") is not True:
         return ""
-    expires = num(state.get("expiresAtEpoch"))
-    if expires <= now:
+    now_ms = now * 1000
+    expires = ms(state, "expiresAt")
+    if expires <= now_ms:
         return ""
     if state.get("statusState") == "off":
         text = state.get("statusText")
         return text if isinstance(text, str) else ""
     last_ping = state.get("lastPing") if isinstance(state.get("lastPing"), dict) else {}
-    activity = num(state.get("lastActivityAtEpoch"))
-    good_ping = num(last_ping.get("atEpoch")) if last_ping.get("ok") is True else 0
-    warm_at = max(activity, good_ping)
-    word = "idle" if not warm_at else ("cold" if now - warm_at >= HOUR else "warm")
-    parts = ["bun-warmer", word, "%s left" % dur(expires - now)]
-    next_ping = num(state.get("nextPingAtEpoch"))
+    # The hook's lastWarmAt: activity or a ping that found the cache warm; a failed ping never counts. Files from before
+    # lastWarmAtEpochMs existed fall back to activity or the last ping when it was good.
+    warm_at = num(state.get("lastWarmAtEpochMs"))
+    if not warm_at and "lastWarmAtEpochMs" not in state:
+        good_ping = num(last_ping.get("atEpoch")) * 1000 if last_ping.get("ok") is True else 0
+        warm_at = max(ms(state, "lastActivityAt"), good_ping)
+    word = "idle" if not warm_at else ("cold" if now_ms - warm_at >= HOUR_MS else "warm")
+    parts = ["bun-warmer", word, "%s left" % dur((expires - now_ms) / 1000)]
+    next_ping = ms(state, "nextPingAt")
     # The mod's own words for what comes next, e.g. "context under 50,000 tokens, not pinging" or "quiet hours, pings resume 06:00".
     said = state.get("statusText").split(" · ") if isinstance(state.get("statusText"), str) else []
     # Used only when the mod saw the same state word, so a reason never outlives the state it was written for.
     reason = said[3] if len(said) > 3 and said[0] == "bun-warmer" and said[1] == word else ""
     if reason and not reason.startswith("ping in"):
         parts.append(reason)
-    elif word == "warm" and next_ping > now:
-        parts.append("ping in %s" % dur(next_ping - now))
+    elif word == "warm" and next_ping > now_ms:
+        parts.append("ping in %s" % dur((next_ping - now_ms) / 1000))
     if last_ping and last_ping.get("ok") is False:
         parts.append("last ping FAILED")
     stalled = state.get("stalledAgents")
