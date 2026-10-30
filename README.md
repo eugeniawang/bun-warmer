@@ -14,7 +14,7 @@ When your main cache lasts an hour, Bun Warmer sends a small ping after 50 minut
 
 ## Which cache length you have
 
-Bun Warmer reads the same inputs Claude Code uses, in Claude Code's order, when a session starts:
+Bun Warmer reads the same inputs Claude Code uses for the main conversation, in Claude Code's order, when a session starts (Claude Code also has a subagent-only step, a `cacheTtl` in a subagent's frontmatter, which does not apply to the main conversation and is not read):
 
 1. `FORCE_PROMPT_CACHING_5M=1`: 5 minutes, no pings.
 2. `CLAUDE_CODE_PROMPT_CACHE_TTL` (`5m` or `1h`).
@@ -24,10 +24,20 @@ Bun Warmer reads the same inputs Claude Code uses, in Claude Code's order, when 
 
 `DISABLE_PROMPT_CACHING=1` means there is no cache, so no pings. Any value other than `5m` or `1h` is ignored, as Claude Code ignores it. The result is in the state file as `cacheTtl` (`1h`, `5m`, `unknown` or `off`) with `cacheTtlReason`.
 
-On a subscription with no TTL setting, Bun Warmer also stops pinging for the rest of the session when it sees you are past your plan's limit (a `five_hour` or `seven_day` rate-limit window at 100%), or when a ping finds the cache already gone: either means this session is not on the one-hour cache.
+On a subscription with no TTL setting, a login alone does not prove the hour, because a subscription past its plan limit draws on usage credits and gets 5 minutes. So before each ping Bun Warmer reads the plan's rate-limit windows (`five_hour`, `seven_day`, the ones Claude Code reports after each response) and pings only when at least one was read and all are under 100%. No reading yet, a reading that fails, or a window at 100% means no ping; pings resume once a later reading is under the limit. If a ping still finds the cache gone, Bun Warmer stops pinging for the rest of the session. An explicit `1h` (variable or setting) holds on usage credits too, so it needs no reading.
 
 - **Claude subscription (Pro, Max, Team, Enterprise) within plan usage:** works as is.
-- **API key, usage credits, or a cloud provider:** Bun Warmer does nothing unless you choose the one-hour cache yourself. Set `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` (or `"promptCacheTtl": "1h"`) in `~/.claude/settings.json`; this needs Claude Code 2.1.242 or later. One-hour cache writes cost more than five-minute ones (on the API, 2x the input price against 1.25x), so decide that on its own merits first. To check which TTL your writes use, run `claude -p "hello" --output-format json` and look at `usage.cache_creation`: one-hour writes are under `ephemeral_1h_input_tokens`.
+- **API key, usage credits, or a cloud provider:** Bun Warmer does nothing unless you choose the one-hour cache yourself. Choose the one-hour cache in `~/.claude/settings.json` in one of two ways; this needs Claude Code 2.1.242 or later. The variable goes inside the `env` block, the setting goes at the top level, never inside `env`:
+
+```json
+{ "env": { "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h" } }
+```
+
+```json
+{ "promptCacheTtl": "1h" }
+```
+
+ One-hour cache writes cost more than five-minute ones (on the API, 2x the input price against 1.25x), so decide that on its own merits first. To check which TTL your writes use, run `claude -p "hello" --output-format json` and look at `usage.cache_creation`: one-hour writes are under `ephemeral_1h_input_tokens`.
 
 Inspired by [cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal (MIT). Bun Warmer is written from scratch; none of its code is copied.
 
@@ -82,7 +92,7 @@ Every setting is an environment variable, so it goes in the `env` block of `~/.c
 }
 ```
 
-Only on an API key, usage credits or a cloud provider, and only if you want the one-hour cache (it changes what every request costs, not just Bun Warmer's): add `"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"`.
+Only on an API key, usage credits or a cloud provider, and only if you want the one-hour cache (it changes what every request costs, not just Bun Warmer's): add `"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"` inside this same `env` block.
 
 ### Updating
 
@@ -261,7 +271,7 @@ Each session writes `~/.claude/bun-warmer/<session-id>.json` on every arm, disar
   "pulse": { "available": true, "reason": null, "checkedAt": "…", "checkedAtEpoch": 0, "agentsSeen": 1 },
   "maxHours": 12,
   "configWarnings": [],
-  "cacheTtl": "1h", "cacheTtlReason": "Claude subscription default",
+  "cacheTtl": "1h", "cacheTtlReason": "Claude subscription default", "planUsageNote": null,
   "note": null,
   "stallMin": 20,
   "stallCheckMin": 5,
@@ -286,7 +296,7 @@ If a write fails, the old file is kept and `<session-id>.error.json` is written 
 
 ## Limitations
 
-- Bun Warmer cannot ask Claude Code which cache length a request got. It reads the same settings and login kind Claude Code reads. A subscription that starts drawing on usage credits mid-session is noticed only from the rate-limit reading after a response, or when a ping finds the cache gone; that one ping pays for a re-write before pings stop.
+- Bun Warmer cannot ask Claude Code which cache length a request got. It reads the same settings and login kind Claude Code reads. On a subscription with no TTL setting it judges plan usage from the last rate-limit reading. If the plan crosses its limit after that reading and before the ping, that one ping can find a 5-minute cache gone and pay for a re-write; pings then stop for the session.
 - The mod API cannot withdraw a queued prompt. Bun Warmer re-checks its state just before it sends a stall message, but if you run `/bunwarm off` or `/clear` in that instant, one stall message can still arrive late. The message starts with the time it was sent and says to ignore it if the mod was turned off or the subagent has finished.
 - If a turn's completion event is never delivered, Bun Warmer keeps treating the main conversation as busy and holds stall messages until the session resets.
 - A ping's events carry no marker. While a ping is in flight, a main-conversation event with no agent id is taken for the ping's and ignored. The next event after the ping counts.

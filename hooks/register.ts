@@ -53,8 +53,14 @@ export function resolveCacheTtl(i: TtlInputs): { ttl: CacheTtl; why: string } {
   return { ttl: 'unknown', why: 'the login kind could not be read' }
 }
 
+/** True when pings may go out: the main cache is known to last an hour, and a subscription default is backed by a current plan-usage reading. */
+function hourCache(st: { cacheTtl: CacheTtl; planNote: string | null }): boolean {
+  return st.cacheTtl === '1h' && !st.planNote
+}
+
 /** Why no ping goes out for a cache that is not known to last an hour, in the status line's words. */
-function ttlNote(st: { cacheTtl: CacheTtl; cacheTtlWhy: string }): string {
+function ttlNote(st: { cacheTtl: CacheTtl; cacheTtlWhy: string; planNote: string | null }): string {
+  if (st.cacheTtl === '1h' && st.planNote) return `main cache may be 5 minutes (${st.planNote}), not pinging`
   if (st.cacheTtl === 'off') return `prompt caching is off (${st.cacheTtlWhy}), not pinging`
   if (st.cacheTtl === '5m') return `main cache lasts 5 minutes (${st.cacheTtlWhy}), so a ping cannot keep it warm; not pinging`
   return `main cache length unknown (${st.cacheTtlWhy}), not pinging; set CLAUDE_CODE_PROMPT_CACHE_TTL=1h to opt in`
@@ -133,6 +139,8 @@ type State = {
   /** The main conversation's cache lifetime and where that answer came from. Pings go out only for `1h`. */
   cacheTtl: CacheTtl
   cacheTtlWhy: string
+  /** Set while a subscription-default hour is not proven by the last usage reading (none yet, unreadable, or a plan window at 100%, i.e. usage credits). No ping while set. */
+  planNote: string | null
   /** Settings that were out of range or not usable at session start, each with the default that replaced it. Our own words plus the variable name, never a raw value. */
   warnings: string[]
 }
@@ -180,6 +188,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     configWarnings: s.warnings,
     cacheTtl: s.cacheTtl,
     cacheTtlReason: s.cacheTtlWhy,
+    planUsageNote: s.planNote,
     pulse: s.pulse && { available: s.pulse.available, reason: s.pulse.reason, checkedAt: isoLocal(s.pulse.checkedAt), checkedAtEpoch: epoch(s.pulse.checkedAt), agentsSeen: s.pulse.agentsSeen },
     maxHours: s.maxMs / HOUR,
     note: s.note,
@@ -262,7 +271,7 @@ export function freshState(): State {
     lastPing: null, statusText: '', statusState: 'off', nextPingAt: 0, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
-    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet',
+    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet', planNote: null,
   }
 }
 
@@ -405,7 +414,7 @@ function lastWarmAt(st: State): number {
  * is not retried sooner than one interval; warm or cold counts only lastWarmAt, so no ping, retry or not, goes out once the cache is cold.
  */
 function nextPingAt(st: State): number {
-  if (st.cacheTtl !== '1h') return 0
+  if (!hourCache(st)) return 0
   const base = Math.max(st.lastActivityAt, st.lastPingAt)
   const warmAt = lastWarmAt(st)
   if (!base || !warmAt) return 0
@@ -422,7 +431,7 @@ function describe(now: number): { text: string; alert: string; state: string; pi
   }
   const fail = s.lastPing && !s.lastPing.ok ? ` · last ping FAILED: ${s.lastPing.reason}` : ''
   const stall = stallText()
-  if (s.cacheTtl !== '1h') {
+  if (!hourCache(s)) {
     // Shown once in the UI (it does not change on its own), so a newcomer learns why the mod sends nothing.
     const text = `bun-warmer off: ${ttlNote(s)}${fail}${stall}${dur}`
     return { text, alert: text, state: 'off', pingAt: 0 }
@@ -793,7 +802,7 @@ async function tick($: EngineInterface) {
   }
   await refreshCtx($)
   if (gen !== generation) return
-  if (s.cacheTtl !== '1h') {
+  if (!hourCache(s)) {
     schedule($, now)
     status($, now)
     await persist($)
@@ -884,19 +893,28 @@ async function activity($: EngineInterface, human: boolean, agentId?: string) {
   await persist($)
 }
 
+/**
+ * The plan-usage proof a subscription-default hour needs, from the last reading: null when a five_hour or seven_day window was read and all are under 100%.
+ * Past 100% the session draws on usage credits, where Claude Code drops the main cache to five minutes unless the person chose the TTL,
+ * so an explicit 1h (env or setting) needs no proof and holds on credits too.
+ */
+export function planUsageNote(limits: Array<{ kind: string; percentUsed: number }> | null): string | null {
+  if (limits === null) return 'plan usage could not be read'
+  const plan = limits.filter(r => r && (r.kind === 'five_hour' || r.kind === 'seven_day') && typeof r.percentUsed === 'number' && Number.isFinite(r.percentUsed))
+  if (!plan.length) return 'no plan usage reading yet'
+  if (plan.some(r => r.percentUsed >= 100)) return 'subscription past its plan limit, on usage credits'
+  return null
+}
+
 async function refreshCtx($: EngineInterface) {
+  let limits: Array<{ kind: string; percentUsed: number }> | null = null
   try {
     const u = await $.session.usage()
     const live = u.context.tokens
     if (live && live > 0) s.ctx = live
-    // A subscription past a plan window is billed from usage credits, where Claude Code drops the main cache to five minutes
-    // unless the person chose the TTL. Only the subscription default is downgraded; an explicit 1h holds on credits too.
-    const over = (u.rateLimits ?? []).some(r => (r.kind === 'five_hour' || r.kind === 'seven_day') && typeof r.percentUsed === 'number' && r.percentUsed >= 100)
-    if (over && s.cacheTtl === '1h' && s.cacheTtlWhy === SUBSCRIPTION_DEFAULT) {
-      s.cacheTtl = '5m'
-      s.cacheTtlWhy = 'subscription past its plan limit, on usage credits'
-    }
-  } catch { /* usage is advisory */ }
+    limits = Array.isArray(u.rateLimits) ? u.rateLimits : []
+  } catch { /* usage is advisory; no reading means no proof of the plan hour */ }
+  s.planNote = s.cacheTtlWhy === SUBSCRIPTION_DEFAULT ? planUsageNote(limits) : null
 }
 
 /** Reads what decides the main cache's lifetime: the four variables, the promptCacheTtl setting and the login kind. Any read that fails counts as unset, the login as unknown. */
@@ -999,7 +1017,7 @@ export const register: Register = (on, options) => {
     if (word === 'off') { await disarm($, 'turned off'); return { text: 'bun-warmer is off for this session' } }
     if (word === 'on') { await arm($, now); return { text: `bun-warmer on for ${fmtDur(s.windowMs)}, a ping after ${fmtDur(s.intervalMs)} of quiet` } }
     if (!s.armed) return { text: `bun-warmer is off${s.note ? ` (${s.note})` : ''}` }
-    if (s.cacheTtl !== '1h') return { text: `bun-warmer on but ${ttlNote(s)}` }
+    if (!hourCache(s)) return { text: `bun-warmer on but ${ttlNote(s)}` }
     const fail = s.lastPing && !s.lastPing.ok ? `; last ping FAILED: ${s.lastPing.reason}` : s.lastPing ? '; last ping ok' : ''
     return { text: `bun-warmer on, ${fmtDur(s.expiresAt - now)} left, ${s.refusals} failed or refused pings${s.skippedQuiet ? `, ${s.skippedQuiet} skipped for quiet hours` : ''}${fail}` }
   })
@@ -1021,7 +1039,7 @@ export const register: Register = (on, options) => {
     // The cold period is named by the moment the cache was last refreshed, so a successful ping after the last activity keeps it warm.
     const warmAt = lastWarmAt(s)
     // Only an hour-long cache is kept warm, so only there is a cold send worth a warning.
-    const cold = s.cacheTtl === '1h' && warmAt > 0 && now - warmAt >= COLD_AFTER_MS
+    const cold = hourCache(s) && warmAt > 0 && now - warmAt >= COLD_AFTER_MS
     const typed = typeof e.text === 'string' && !e.text.trimStart().startsWith('/')
     if (typed && cold && s.ctx >= s.minTokens) {
       const msg = `bun-warmer: the prompt cache went cold ${fmtDur(now - warmAt - COLD_AFTER_MS)} ago, so this send re-writes about ${s.ctx.toLocaleString('en-US')} tokens at the cache-write rate.`

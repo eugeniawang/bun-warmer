@@ -10,7 +10,10 @@ const START = 1_800_000_000_000
 type Auth = { handle: string; kind: 'bearer' | 'api-key' } | null | 'throw'
 
 /** A session whose login kind, env, settings and rate limits each test chooses. Counts pings (forks). */
-function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settings?: Record<string, unknown>; rateLimits?: Array<{ kind: string; percentUsed: number }>; cacheGone?: boolean } = {}) {
+type Limits = Array<{ kind: string; percentUsed: number }> | 'throw'
+
+function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settings?: Record<string, unknown>; rateLimits?: Limits; cacheGone?: boolean } = {}) {
+  let limits: Limits = opts.rateLimits ?? [{ kind: 'five_hour', percentUsed: 10 }]
   const env = { BUN_WARMER_QUIET_HOURS: 'off', ...(opts.env ?? {}) }
   const files = new Map<string, string>()
   const forks: number[] = []
@@ -23,7 +26,7 @@ function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settin
   on('session.id', () => ({ value: 'S1' }))
   on('session.authorize', () => { if (auth === 'throw') throw new Error('no'); return { value: auth } })
   on('settings.read', () => ({ value: (opts.settings ?? {}) as never }))
-  on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: 200000 }, rateLimits: opts.rateLimits ?? [] } as never }))
+  on('session.usage', () => { if (limits === 'throw') throw new Error('no usage'); return { value: { startedAt: START, context: { window: 1000000, tokens: 200000 }, rateLimits: limits } as never } })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] as never }))
   on('ui.status', () => ({ value: undefined }))
@@ -38,7 +41,7 @@ function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settin
       : { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 200000, cache_creation_input_tokens: 10 }
     return { value: { isAnswered: true, text: 'warm', usage } as never }
   })
-  return { forks, logs, state: () => JSON.parse(files.get('/home/t/.claude/bun-warmer/S1.json.json') ?? files.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any> }
+  return { forks, logs, setLimits: (l: Limits) => { limits = l }, state: () => JSON.parse(files.get('/home/t/.claude/bun-warmer/S1.json.json') ?? files.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any> }
 }
 
 const start = { surface: null, isInteractive: false, cwd: '/work' } as const
@@ -131,6 +134,32 @@ describe('no ping unless the main cache is known to last an hour', () => {
     const { w } = await quietHour(on, $, { rateLimits: [{ kind: 'five_hour', percentUsed: 100 }] })
     expect(w.forks.length).toBe(0)
     expect(w.state().statusText).toContain('usage credits')
+  })
+
+  test('subscription with no rate-limit reading yet: no proof it is within plan usage, so no ping', async ($, on) => {
+    const { w } = await quietHour(on, $, { rateLimits: [] })
+    expect(w.forks.length).toBe(0)
+    expect(w.state().statusText).toContain('not pinging')
+  })
+
+  test('subscription whose usage cannot be read: no ping', async ($, on) => {
+    const { w } = await quietHour(on, $, { rateLimits: 'throw' })
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('subscription on usage credits, then the window resets: pings resume', async ($, on) => {
+    const { w, clock } = await quietHour(on, $, { rateLimits: [{ kind: 'five_hour', percentUsed: 100 }] })
+    expect(w.forks.length).toBe(0)
+    w.setLimits([{ kind: 'five_hour', percentUsed: 5 }, { kind: 'seven_day', percentUsed: 40 }])
+    await $.prompt.submit({ text: 'hello', wait: false, origin: composer })
+    await $.turn.complete(answer())
+    await clock.advance(55 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('an explicit CLAUDE_CODE_PROMPT_CACHE_TTL=1h holds on usage credits too: pings', async ($, on) => {
+    const { w } = await quietHour(on, $, { env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }, rateLimits: [{ kind: 'five_hour', percentUsed: 100 }] })
+    expect(w.forks.length).toBe(1)
   })
 
   test('subscription default, but a ping finds the cache gone: no more pings this session, even after new activity', async ($, on) => {
