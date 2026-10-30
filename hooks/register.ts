@@ -145,6 +145,8 @@ type State = {
   cacheTtlWhy: string
   /** Set while a subscription-default hour is not proven by the last usage reading (none yet, unreadable, or a plan window at 100%, i.e. usage credits). No ping while set. */
   planNote: string | null
+  /** Set when a ping found the cache gone under the subscription default: no more pings this session, whatever a re-read says. */
+  ttlLatched: boolean
   /** Settings that were out of range or not usable at session start, each with the default that replaced it. Our own words plus the variable name, never a raw value. */
   warnings: string[]
 }
@@ -275,7 +277,7 @@ export function freshState(): State {
     lastPing: null, statusText: '', statusState: 'off', nextPingAt: 0, ctx: 0, intervalMs: 50 * MIN, windowMs: DEFAULT_WINDOW_MIN * MIN, minTokens: DEFAULT_MIN_TOKENS, maxMs: DEFAULT_MAX_HOURS * HOUR, guard: 'warn', ackedAt: 0, note: null,
     stallMs: 20 * MIN, stallCheckMs: 5 * MIN, stalled: [],
     quietEnabled: true, activeStart: DEFAULT_ACTIVE_START, activeEnd: DEFAULT_ACTIVE_END, skippedQuiet: 0, lastSkippedAt: 0, notBefore: 0, skippedSmall: 0, pulse: null, warnings: [],
-    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet', planNote: null,
+    cacheTtl: 'unknown', cacheTtlWhy: 'not read yet', planNote: null, ttlLatched: false,
   }
 }
 
@@ -325,7 +327,7 @@ function resetSession() {
   stallMessages.clear()
   pinging = false
   const c = freshState()
-  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings, cacheTtl: s.cacheTtl, cacheTtlWhy: s.cacheTtlWhy })
+  Object.assign(s, c, { intervalMs: s.intervalMs, windowMs: s.windowMs, minTokens: s.minTokens, maxMs: s.maxMs, guard: s.guard, stallMs: s.stallMs, stallCheckMs: s.stallCheckMs, quietEnabled: s.quietEnabled, activeStart: s.activeStart, activeEnd: s.activeEnd, warnings: s.warnings })
   lastEventAt.clear()
   mainTurns.clear()
   errorFileWritten = false
@@ -340,6 +342,8 @@ async function ensureSession($: EngineInterface) {
   if (s.sid === id) return
   if (s.sid) resetSession()
   s.sid = id
+  // A new conversation (after /clear or a resume) is judged afresh.
+  await updateCacheTtl($)
 }
 
 // The file is written beside its final name and moved over it, so a reader never sees half a file.
@@ -804,6 +808,8 @@ async function tick($: EngineInterface) {
     await persist($)
     return
   }
+  // Claude Code decides the TTL per request, so a changed setting, variable or login counts from the next ping on.
+  await updateCacheTtl($)
   await refreshCtx($)
   if (gen !== generation) return
   if (!hourCache(s)) {
@@ -864,6 +870,7 @@ async function ping($: EngineInterface, now: number) {
   if (gen !== generation) return
   s.lastPing = result
   if (!result.ok && result.read !== null && s.cacheTtlWhy === SUBSCRIPTION_DEFAULT) {
+    s.ttlLatched = true
     // The cache did not last the interval: this session is not getting the hour (on usage credits, or a plan without it). Stop paying for pings.
     s.cacheTtl = '5m'
     s.cacheTtlWhy = 'a ping found the cache already gone, so this session is not on the one-hour cache'
@@ -919,6 +926,14 @@ async function refreshCtx($: EngineInterface) {
     limits = Array.isArray(u.rateLimits) ? u.rateLimits : []
   } catch { /* usage is advisory; no reading means no proof of the plan hour */ }
   s.planNote = s.cacheTtlWhy === SUBSCRIPTION_DEFAULT ? planUsageNote(limits) : null
+}
+
+/** Re-reads the main cache's lifetime into the state, unless a ping already proved this session is not on the hour. */
+async function updateCacheTtl($: EngineInterface) {
+  if (s.ttlLatched) return
+  const ttl = await readCacheTtl($)
+  s.cacheTtl = ttl.ttl
+  s.cacheTtlWhy = ttl.why
 }
 
 /** Reads what decides the main cache's lifetime: the four variables, the promptCacheTtl setting and the login kind. Any read that fails counts as unset, the login as unknown. */
@@ -989,9 +1004,7 @@ export const register: Register = (on, options) => {
     if (rawStart !== undefined && hourSetting(rawStart, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_START ignored: not a whole hour from 0 to 23, so the default applies')
     if (rawEnd !== undefined && hourSetting(rawEnd, -1) === -1) warnings.push('BUN_WARMER_ACTIVE_END ignored: not a whole hour from 0 to 23, so the default applies')
     s.guard = options.guard === 'refuse' ? 'refuse' : 'warn'
-    const ttl = await readCacheTtl($)
-    s.cacheTtl = ttl.ttl
-    s.cacheTtlWhy = ttl.why
+    await updateCacheTtl($)
     await $.command.register({ name: 'bunwarm', description: 'Bun Warmer: status, on, or off for the cache-warming pings', argumentHint: '[status | on | off]', immediate: true })
     await refreshCtx($)
     await arm($, await $.clock.now())

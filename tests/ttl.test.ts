@@ -25,7 +25,8 @@ function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settin
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
   on('session.authorize', () => { if (auth === 'throw') throw new Error('no'); return { value: auth } })
-  on('settings.read', () => ({ value: (opts.settings ?? {}) as never }))
+  let settings = opts.settings ?? {}
+  on('settings.read', () => ({ value: settings as never }))
   on('session.usage', () => { if (limits === 'throw') throw new Error('no usage'); return { value: { startedAt: START, context: { window: 1000000, tokens: 200000 }, rateLimits: limits } as never } })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] as never }))
@@ -41,7 +42,7 @@ function world(on: On, opts: { auth?: Auth; env?: Record<string, string>; settin
       : { input_tokens: 2, output_tokens: 1, cache_read_input_tokens: 200000, cache_creation_input_tokens: 10 }
     return { value: { isAnswered: true, text: 'warm', usage } as never }
   })
-  return { forks, logs, setLimits: (l: Limits) => { limits = l }, state: () => JSON.parse(files.get('/home/t/.claude/bun-warmer/S1.json.json') ?? files.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any> }
+  return { forks, logs, setLimits: (l: Limits) => { limits = l }, setSettings: (x: Record<string, unknown>) => { settings = x }, state: () => JSON.parse(files.get('/home/t/.claude/bun-warmer/S1.json.json') ?? files.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any> }
 }
 
 const start = { surface: null, isInteractive: false, cwd: '/work' } as const
@@ -181,6 +182,17 @@ describe('no ping unless the main cache is known to last an hour', () => {
   test('subscription default, but a ping finds the cache gone: no more pings this session, even after new activity', async ($, on) => {
     const { w, clock } = await quietHour(on, $, { cacheGone: true })
     expect(w.forks.length).toBe(1)
+    await $.prompt.submit({ text: 'hello', wait: false, origin: composer })
+    await $.turn.complete(answer())
+    await clock.advance(70 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.state().cacheTtl).toBe('5m')
+  })
+
+  test('the TTL is read again before every ping: promptCacheTtl changed from 1h to 5m mid-session stops pings', async ($, on) => {
+    const { w, clock } = await quietHour(on, $, { auth: { handle: 'h', kind: 'api-key' }, settings: { promptCacheTtl: '1h' } })
+    expect(w.forks.length).toBe(1)
+    w.setSettings({ promptCacheTtl: '5m' })
     await $.prompt.submit({ text: 'hello', wait: false, origin: composer })
     await $.turn.complete(answer())
     await clock.advance(70 * MIN)
