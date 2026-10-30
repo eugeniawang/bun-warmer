@@ -34,6 +34,16 @@ class Segment(unittest.TestCase):
     def test_cold_after_an_hour_without_activity_or_good_ping(self):
         self.assertEqual(sl.segment(state(lastActivityAtEpoch=NOW - 61 * 60), NOW), "bun-warmer · cold · 2h10m left")
 
+    def test_idle_and_cold_keep_the_mods_reason_when_it_saw_the_same_state(self):
+        s = state(lastActivityAtEpoch=0, statusState="idle", statusText="bun-warmer · idle · 3h00m left · waiting for the first turn")
+        self.assertEqual(sl.segment(s, NOW), "bun-warmer · idle · 2h10m left · waiting for the first turn")
+        s = state(lastActivityAtEpoch=NOW - 61 * 60, statusText="bun-warmer · cold · 1h00m left · cache cold, waiting for activity")
+        self.assertEqual(sl.segment(s, NOW), "bun-warmer · cold · 2h10m left · cache cold, waiting for activity")
+
+    def test_a_reason_written_for_another_state_is_not_shown(self):
+        s = state(lastActivityAtEpoch=NOW - 61 * 60, statusText="bun-warmer · warm · 1h00m left · ping in 5m")
+        self.assertEqual(sl.segment(s, NOW), "bun-warmer · cold · 2h10m left")
+
     def test_a_good_ping_keeps_it_warm(self):
         s = state(lastActivityAtEpoch=NOW - 90 * 60, lastPing={"ok": True, "atEpoch": NOW - 40 * 60})
         self.assertTrue(sl.segment(s, NOW).startswith("bun-warmer · warm"))
@@ -56,6 +66,7 @@ class Segment(unittest.TestCase):
         self.assertEqual(sl.safe_name("89e8e7d6-ca67-44fd-bb20-87b456e44dca"), "89e8e7d6-ca67-44fd-bb20-87b456e44dca")
         self.assertEqual(sl.safe_name("a/b"), "a%2Fb")
         self.assertEqual(sl.safe_name("a.b%"), "a%2Eb%25")
+        self.assertEqual(sl.safe_name("x\ud800"), "x%EF%BF%BD")
 
 
 class Main(unittest.TestCase):

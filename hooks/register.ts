@@ -581,10 +581,37 @@ export function cleanupTargets(entries: ReadonlyArray<{ name: string; kind: stri
   for (const e of entries) {
     if (!e || e.kind !== 'file' || typeof e.name !== 'string' || e.name.includes('/') || e.name === own || !Number.isFinite(e.mtimeMs)) continue
     const age = now - e.mtimeMs
+    if (e.name.startsWith('.bwclean-')) continue // a file cleanup set aside and could not put back: never deleted by a later pass
     if (e.name.startsWith('.') && e.name.endsWith('.json.tmp')) { if (age > 24 * HOUR) remove.push(e.name); continue }
     if (e.name.endsWith('.json') && !e.name.endsWith('.error.json') && age > keepDays * 24 * HOUR) check.push(e.name)
   }
   return { check, remove }
+}
+
+/**
+ * Removes one listed file only if, after it is moved aside under a name no session writes, the moved file is still a plain old file (and, for
+ * a state file, says `armed: false`). A session that rewrote the name in the gap either lands its write after the move (its new file stays)
+ * or had its file moved (it fails the check and is moved back unless a newer one took the name). So only the very file that was checked is deleted.
+ */
+async function removeIfStillOld($: EngineInterface, dir: string, name: string, cutoff: number, needDisarmed: boolean): Promise<boolean> {
+  const from = `${dir}/${name}`
+  const aside = `${dir}/.bwclean-${Math.random().toString(36).slice(2)}-${name}`
+  if ((await $.process.run(['mv', '-n', '--', from, aside])).exitCode !== 0) return false
+  let remove = false
+  try {
+    const st = await $.fs.stat(aside)
+    if (!st.isLink && st.kind === 'file' && st.mtimeMs < cutoff) {
+      if (!needDisarmed) remove = true
+      else {
+        const j = JSON.parse(String(await $.fs.read(aside))) as Record<string, unknown> | null
+        remove = !!j && typeof j === 'object' && j.armed === false
+      }
+    }
+  } catch { remove = false }
+  if (remove) return (await $.process.run(['rm', '-f', '--', aside])).exitCode === 0
+  // Not ours to delete: put it back. If a newer file has taken the name since, the moved copy is left aside (`.bwclean-*`, never deleted).
+  try { await $.process.run(['mv', '-n', '--', aside, from]) } catch { /* left aside */ }
+  return false
 }
 
 /** Removes old disarmed state files and orphan temp files. Conservative: a file that cannot be read or parsed, or is not `armed: false`, stays. Never throws. */
@@ -598,16 +625,12 @@ async function cleanup($: EngineInterface) {
     const { check, remove } = cleanupTargets(await $.fs.list(dir), now, s.keepDays, `${safeName(s.sid)}.json`)
     let removed = 0
     for (const name of remove) {
-      if (removed >= CLEANUP_MAX) return
-      try { if ((await $.process.run(['rm', '-f', '--', `${dir}/${name}`])).exitCode === 0) removed++ } catch { /* next */ }
+      if (removed >= CLEANUP_MAX) break
+      try { if (await removeIfStillOld($, dir, name, now - 24 * HOUR, false)) removed++ } catch { /* next */ }
     }
     for (const name of check) {
-      if (removed >= CLEANUP_MAX) return
-      try {
-        const j = JSON.parse(String(await $.fs.read(`${dir}/${name}`))) as Record<string, unknown> | null
-        if (!j || typeof j !== 'object' || j.armed !== false) continue
-        if ((await $.process.run(['rm', '-f', '--', `${dir}/${name}`])).exitCode === 0) removed++
-      } catch { /* unreadable or not JSON: kept */ }
+      if (removed >= CLEANUP_MAX) break
+      try { if (await removeIfStillOld($, dir, name, now - s.keepDays * 24 * HOUR, true)) removed++ } catch { /* kept */ }
     }
     if (removed) await safeLog($, `removed ${removed} old state file${removed === 1 ? '' : 's'} (older than ${s.keepDays} days, BUN_WARMER_KEEP_DAYS)`)
   } catch { /* the folder may not exist yet; cleanup is best effort */ }

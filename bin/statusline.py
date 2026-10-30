@@ -27,7 +27,11 @@ def safe_name(sid):
         if ch.isascii() and (ch.isalnum() or ch in "_-"):
             out.append(ch)
         else:
-            out.extend("%%%02X" % b for b in ch.encode("utf-8", "replace"))
+            try:
+                data = ch.encode("utf-8")
+            except UnicodeEncodeError:  # a lone surrogate: the mod writes U+FFFD for it
+                data = "\ufffd".encode("utf-8")
+            out.extend("%%%02X" % b for b in data)
     return "".join(out)
 
 
@@ -56,8 +60,9 @@ def segment(state, now):
     next_ping = state.get("nextPingAtEpoch") or 0
     # The mod's own words for what comes next, e.g. "context under 50,000 tokens, not pinging" or "quiet hours, pings resume 06:00".
     said = state.get("statusText").split(" · ") if isinstance(state.get("statusText"), str) else []
-    reason = said[3] if len(said) > 3 and said[0] == "bun-warmer" else ""
-    if word == "warm" and reason and not reason.startswith("ping in"):
+    # Used only when the mod saw the same state word, so a reason never outlives the state it was written for.
+    reason = said[3] if len(said) > 3 and said[0] == "bun-warmer" and said[1] == word else ""
+    if reason and not reason.startswith("ping in"):
         parts.append(reason)
     elif word == "warm" and isinstance(next_ping, (int, float)) and next_ping > now:
         parts.append("ping in %s" % dur(next_ping - now))

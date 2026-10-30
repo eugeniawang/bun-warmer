@@ -250,7 +250,7 @@ Nothing else removes state files, so at each session start Bun Warmer tidies `~/
 - state files (`*.json`, not `*.error.json`) older than `BUN_WARMER_KEEP_DAYS` (default 30 days) whose content says `armed: false`, which means the window ended, `/bunwarm off`, `/clear` or session end;
 - leftover temp files (`.*.json.tmp`) older than a day.
 
-It never removes the current session's file, a file it cannot read or parse, a file that does not say `armed: false`, a directory or a link, and at most 500 files per session start. `BUN_WARMER_KEEP_DAYS=0` turns cleanup off. Age is the file's modification time.
+It never removes the current session's file, a file it cannot read or parse, a file that does not say `armed: false`, a directory or a link, and at most 500 files per session start. `BUN_WARMER_KEEP_DAYS=0` turns cleanup off. Age is the file's modification time. Each file is first moved aside to a `.bwclean-*` name and checked again there, so a session that writes its file in the meantime never loses it: a file that fails the second check is moved back, and if a newer file has taken its name, the moved copy stays as `.bwclean-*`, which cleanup never deletes.
 
 ## What it saves
 

@@ -12,7 +12,10 @@ type Agent = { id: string; description: string; type: string; status: string }
 type Entry = { name: string; kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isLink: boolean }
 
 /** A session with a state folder the test fills, a record of every rm, and a prompt.submit record. */
-function world(on: On, opts: { env?: Record<string, string>; dir?: Entry[]; contents?: Record<string, string>; cacheGone?: boolean } = {}) {
+type Disk = Map<string, { text: string; mtimeMs: number; kind: Entry['kind']; isLink: boolean }>
+
+/** opts.disk: the files in ~/.claude/bun-warmer, by full path. opts.onMove runs after each cleanup move (a session writing in the gap). */
+function world(on: On, opts: { env?: Record<string, string>; disk?: Disk; onMove?: (disk: Disk, from: string, to: string) => void; cacheGone?: boolean } = {}) {
   const env = { BUN_WARMER_QUIET_HOURS: 'off', ...(opts.env ?? {}) }
   const finals = new Map<string, string>()
   const files = new Map<string, string>()
@@ -22,13 +25,26 @@ function world(on: On, opts: { env?: Record<string, string>; dir?: Entry[]; cont
   let agents: Agent[] = []
   on('env.get', ($, e) => ({ value: e.name === 'HOME' ? '/home/t' : env[e.name as keyof typeof env] }))
   on('fs.write', ($, e) => { files.set(e.path, e.text); return { value: undefined } })
-  on('fs.list', ($, e) => { if (opts.dir === undefined) throw new Error('no dir'); return { value: opts.dir as never } })
-  on('fs.read', ($, e) => { const t = opts.contents?.[e.path]; if (t === undefined) throw new Error('missing'); return { value: t as never } })
+  const disk = opts.disk
+  const ok = (exitCode = 0) => ({ value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('fs.list', ($, e) => {
+    if (!disk) throw new Error('no dir')
+    return { value: [...disk].filter(([p]) => p.startsWith(e.path + '/')).map(([p, f]) => ({ name: p.slice(e.path.length + 1), kind: f.isLink ? 'other' : f.kind, size: f.text.length, mtimeMs: f.mtimeMs, isLink: f.isLink })) as never }
+  })
+  on('fs.stat', ($, e) => { const f = disk?.get(e.path); if (!f) throw new Error('missing'); return { value: { kind: f.kind, size: f.text.length, mtimeMs: f.mtimeMs, isLink: f.isLink } as never } })
+  on('fs.read', ($, e) => { const f = disk?.get(e.path); if (!f) throw new Error('missing'); return { value: f.text as never } })
   on('process.run', ($, e) => {
-    const [cmd, , from, to] = e.argv
-    if (cmd === 'mv') { finals.set(to, files.get(from) ?? ''); files.delete(from) }
-    if (cmd === 'rm' && e.argv.includes('--')) removed.push(e.argv[e.argv.length - 1])
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const a = e.argv
+    if (a[0] === 'mv' && a[1] === '-n' && a[2] === '--' && disk) {
+      const [from, to] = [a[3], a[4]]
+      if (!disk.has(from) || disk.has(to)) return ok(1)
+      disk.set(to, disk.get(from)!); disk.delete(from)
+      opts.onMove?.(disk, from, to)
+      return ok()
+    }
+    if (a[0] === 'mv') { finals.set(a[3], files.get(a[2]) ?? ''); files.delete(a[2]); return ok() }
+    if (a[0] === 'rm' && a.includes('--')) { const p = a[a.length - 1]; removed.push(p); disk?.delete(p) }
+    return ok()
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
@@ -49,7 +65,7 @@ function world(on: On, opts: { env?: Record<string, string>; dir?: Entry[]; cont
     return { value: { isAnswered: true, text: 'warm', usage } as never }
   })
   return {
-    removed, sent, forks,
+    removed, sent, forks, disk,
     setAgents: (a: Agent[]) => { agents = a },
     state: () => JSON.parse(finals.get('/home/t/.claude/bun-warmer/S1.json') ?? 'null') as Record<string, any>,
   }
@@ -102,30 +118,85 @@ describe('state-file cleanup', () => {
     const t = cleanupTargets(entries, now, 30, 'S1.json')
     expect(t.check.sort()).toEqual(['old-off.json', 'old-on.json'])
     expect(t.remove).toEqual(['.x.json.tmp'])
+    expect(cleanupTargets([f('.bwclean-abc-old-off.json', 400)], now, 30, 'S1.json')).toEqual({ check: [], remove: [] })
   })
 
   test('keep days 0 deletes nothing', () => {
     expect(cleanupTargets([f('old-off.json', 400), f('.x.json.tmp', 9)], now, 0, 'S1.json')).toEqual({ check: [], remove: [] })
   })
 
+  const D = '/home/t/.claude/bun-warmer'
+  const on_ = (text: string, ageDays: number, kind: Entry['kind'] = 'file', isLink = false) => ({ text, mtimeMs: now - ageDays * DAY, kind, isLink })
+  const off = JSON.stringify({ armed: false })
+  const names = (d: Disk) => [...d.keys()].map(p => p.slice(D.length + 1)).sort()
+
   test('at session start it removes an old disarmed file and an old temp file, and keeps an armed one and an unreadable one', async ($, on) => {
     const clock = mock.clock(on, { now })
-    const D = '/home/t/.claude/bun-warmer'
-    const w = world(on, {
-      dir: [f('old-off.json', 40), f('old-on.json', 40), f('bad.json', 40), f('.x.json.tmp', 2)],
-      contents: { [`${D}/old-off.json`]: JSON.stringify({ armed: false }), [`${D}/old-on.json`]: JSON.stringify({ armed: true }), [`${D}/bad.json`]: '{not json' },
-    })
+    const disk: Disk = new Map([
+      [`${D}/old-off.json`, on_(off, 40)], [`${D}/old-on.json`, on_(JSON.stringify({ armed: true }), 40)],
+      [`${D}/bad.json`, on_('{not json', 40)], [`${D}/.x.json.tmp`, on_('', 2)],
+    ])
+    const w = world(on, { disk })
     await $.session.start(start)
     await clock.settle()
-    expect(w.removed.sort()).toEqual([`${D}/.x.json.tmp`, `${D}/old-off.json`])
+    expect(names(disk)).toEqual(['bad.json', 'old-on.json'])
+  })
+
+  test('a disarmed file rewritten as armed before cleanup reaches it is kept', async ($, on) => {
+    const clock = mock.clock(on, { now })
+    const disk: Disk = new Map([[`${D}/old-off.json`, on_(off, 40)]])
+    const w = world(on, { disk })
+    disk.set(`${D}/old-off.json`, on_(JSON.stringify({ armed: true }), 0))
+    await $.session.start(start)
+    await clock.settle()
+    expect(names(disk)).toEqual(['old-off.json'])
+    expect(JSON.parse(disk.get(`${D}/old-off.json`)!.text).armed).toBe(true)
+    void w
+  })
+
+  test('a file that is no longer old when moved aside (rewritten in the gap) is put back, not deleted', async ($, on) => {
+    const clock = mock.clock(on, { now })
+    const disk: Disk = new Map([[`${D}/old-off.json`, on_(off, 40)]])
+    let hit = false
+    const w = world(on, { disk, onMove: (d, from, to) => { if (!hit && to.includes('.bwclean-')) { hit = true; d.set(to, on_(JSON.stringify({ armed: true }), 0)) } } })
+    await $.session.start(start)
+    await clock.settle()
+    expect(names(disk)).toEqual(['old-off.json'])
+    expect(JSON.parse(disk.get(`${D}/old-off.json`)!.text).armed).toBe(true)
+    void w
+  })
+
+  test('a file swapped for a symlink after the listing is put back, not deleted', async ($, on) => {
+    const clock = mock.clock(on, { now })
+    const disk: Disk = new Map([[`${D}/old-off.json`, on_(off, 40)]])
+    let swapped = false
+    const w = world(on, { disk, onMove: (d, from, to) => { if (!swapped) { swapped = true; d.set(to, { ...d.get(to)!, isLink: true }) } } })
+    await $.session.start(start)
+    await clock.settle()
+    expect(names(disk)).toEqual(['old-off.json'])
+    void w
+  })
+
+  test('a fresh write that lands after the move is left alone and the old copy is removed', async ($, on) => {
+    const clock = mock.clock(on, { now })
+    const disk: Disk = new Map([[`${D}/old-off.json`, on_(off, 40)]])
+    // The session's write lands after the move: its new file must stay, and the old moved-aside copy is the one removed.
+    const w = world(on, { disk, onMove: (d, from) => { if (from.endsWith('/old-off.json')) d.set(from, on_(JSON.stringify({ armed: true }), 0)) } })
+    await $.session.start(start)
+    await clock.settle()
+    expect(names(disk)).toEqual(['old-off.json'])
+    expect(JSON.parse(disk.get(`${D}/old-off.json`)!.text).armed).toBe(true)
+    void w
   })
 
   test('BUN_WARMER_KEEP_DAYS=0 removes nothing', async ($, on) => {
-    mock.clock(on, { now })
-    const D = '/home/t/.claude/bun-warmer'
-    const w = world(on, { env: { BUN_WARMER_KEEP_DAYS: '0' }, dir: [f('old-off.json', 400)], contents: { [`${D}/old-off.json`]: JSON.stringify({ armed: false }) } })
+    const clock = mock.clock(on, { now })
+    const disk: Disk = new Map([[`${D}/old-off.json`, on_(off, 400)]])
+    const w = world(on, { env: { BUN_WARMER_KEEP_DAYS: '0' }, disk })
     await $.session.start(start)
-    expect(w.removed).toEqual([])
+    await clock.settle()
+    expect(names(disk)).toEqual(['old-off.json'])
+    void w
   })
 
   test('a folder that cannot be listed does not break session start', async ($, on) => {
