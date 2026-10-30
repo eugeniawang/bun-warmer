@@ -10,7 +10,7 @@
     "intervalMin": {
       "type": "number",
       "title": "Ping interval (minutes)",
-      "description": "Minutes of quiet before a ping. Default 50; the cache goes cold after 60, so values above 55 are capped. Env BUN_WARMER_INTERVAL_MIN overrides.",
+      "description": "Minutes of quiet before a ping. Default 50; a one-hour cache goes cold after 60, so values above 55 are capped. Pings go out only when the main cache lasts one hour. Env BUN_WARMER_INTERVAL_MIN overrides.",
       "default": 50
     },
     "windowMin": {
