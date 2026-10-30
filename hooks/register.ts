@@ -185,7 +185,9 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
     windowStartAt: isoLocal(s.windowStartAt), windowStartAtEpoch: epoch(s.windowStartAt),
     lastPingAt: isoLocal(s.lastPingAt), lastPingAtEpoch: epoch(s.lastPingAt),
     lastActivityAt: isoLocal(s.lastActivityAt), lastActivityAtEpoch: epoch(s.lastActivityAt),
-    expiresAt: isoLocal(s.expiresAt), expiresAtEpoch: epoch(s.expiresAt),
+    expiresAt: isoLocal(s.expiresAt), expiresAtEpoch: epoch(s.expiresAt), expiresAtEpochMs: s.expiresAt || null,
+    // What the hook judges warm or cold from (lastWarmAt): activity or a ping that found the cache warm. A failed ping never moves it.
+    lastWarmAtEpochMs: lastWarmAt(s) || null,
     refusals: s.refusals,
     guardDrops: s.guardDrops,
     lastPing: s.lastPing && {
@@ -194,7 +196,7 @@ export function stateFile(s: State, writtenAt: number): Record<string, unknown> 
       model: s.lastPing.model ?? null, costUsd: s.lastPing.usd ?? null,
     },
     statusText: s.statusText, statusState: s.statusState,
-    nextPingAt: isoLocal(s.nextPingAt), nextPingAtEpoch: epoch(s.nextPingAt),
+    nextPingAt: isoLocal(s.nextPingAt), nextPingAtEpoch: epoch(s.nextPingAt), nextPingAtEpochMs: s.nextPingAt || null,
     intervalMin: s.intervalMs / MIN,
     windowMin: s.windowMs / MIN,
     windowHours: s.windowMs / HOUR,
